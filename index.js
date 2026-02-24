@@ -84,12 +84,6 @@ function execCmd(command, options = {}) {
       clearTimeout(timer);
       _activeChildren.delete(child.pid);
 
-      // Deferred orphan cleanup: after cmd.exe exits, its children may linger
-      // Wait 500ms then force-kill the tree to catch any orphaned grandchildren
-      if (!timedOut && child.pid) {
-        setTimeout(() => forceKillTree(child.pid), 500);
-      }
-
       const parts = [];
       if (stdout.trim()) parts.push(stdout.trim());
       if (stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
@@ -255,11 +249,6 @@ server.tool(
         clearTimeout(timer);
         _activeChildren.delete(child.pid);
 
-        // Deferred orphan cleanup for PowerShell children
-        if (!timedOut && child.pid) {
-          setTimeout(() => forceKillTree(child.pid), 500);
-        }
-
         const parts = [];
         if (stdout.trim()) parts.push(stdout.trim());
         if (stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
@@ -341,6 +330,9 @@ const MCP_PATTERNS = [
 function isMcpInfrastructure(cmdLine, name) {
   if (name?.toLowerCase() === "conhost.exe") return true; // system-managed
   if (!cmdLine || cmdLine.trim() === "") return true; // unknown = safe
+  // Bare/interactive cmd.exe without /c flag = VS Code terminal or user shell
+  // Only cmd.exe with /c (executing a specific command) should be considered for cleanup
+  if (name?.toLowerCase() === "cmd.exe" && !/\/c\s/i.test(cmdLine)) return true;
   return MCP_PATTERNS.some(p => p.test(cmdLine));
 }
 
@@ -452,7 +444,7 @@ server.tool(
 
 // ─── Background Auto-Reaper ────────────────────────────────────────────────────
 // Periodically scans for orphaned/zombie cmd.exe and powershell.exe processes
-// that slipped past normal cleanup. Runs every 60s, kills processes >90s old.
+// that slipped past normal cleanup. Runs every 60s, kills processes >60s old.
 // Uses unref() so it doesn't prevent Node.js from exiting naturally.
 const _reaperInterval = setInterval(() => {
   try {
@@ -470,7 +462,7 @@ const _reaperInterval = setInterval(() => {
       if (isMcpInfrastructure(proc.CommandLine || "", proc.Name || "")) continue;
 
       const ageMs = now - new Date(proc.Created).getTime();
-      if (ageMs > 90000) { // older than 90 seconds
+      if (ageMs > 60000) { // older than 60 seconds
         forceKillTree(pid);
       }
     }
