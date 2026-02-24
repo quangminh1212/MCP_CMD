@@ -443,22 +443,26 @@ server.tool(
 );
 
 // ─── Background Auto-Reaper ────────────────────────────────────────────────────
-// Periodically scans for orphaned/zombie cmd.exe and powershell.exe processes
-// that slipped past normal cleanup. Runs every 30s, kills processes >30s old.
-// Uses unref() so it doesn't prevent Node.js from exiting naturally.
+// SAFE reaper: only kills orphaned processes that WE spawned (ParentProcessId = our PID).
+// Never kills processes from other software, VS Code, or user terminals.
+// Skips processes still in _activeChildren (those have their own timeout).
+// Runs every 30s, kills our orphans >30s old.
 const _reaperInterval = setInterval(() => {
   try {
-    const script = `@(Get-CimInstance Win32_Process -Filter \"(Name='cmd.exe' OR Name='powershell.exe')\" -EA SilentlyContinue | Select-Object ProcessId, Name, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`;
+    const myPid = process.pid;
+    const script = `@(Get-CimInstance Win32_Process -Filter "(ParentProcessId=${myPid})" -EA SilentlyContinue | Select-Object ProcessId, Name, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`;
     const raw = psSync(script, 8000);
     if (!raw.trim()) return;
     const parsed = JSON.parse(raw.trim());
     const procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
     const now = Date.now();
-    const myPid = process.pid;
 
     for (const proc of procs) {
       const pid = proc.ProcessId;
-      if (!pid || pid === myPid) continue;
+      if (!pid) continue;
+      // Skip processes we're actively managing (they have their own timeout)
+      if (_activeChildren.has(pid)) continue;
+      // Skip MCP infrastructure (just in case)
       if (isMcpInfrastructure(proc.CommandLine || "", proc.Name || "")) continue;
 
       const ageMs = now - new Date(proc.Created).getTime();
