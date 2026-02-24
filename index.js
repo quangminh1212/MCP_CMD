@@ -260,22 +260,23 @@ server.tool(
 
 // ─── Tool 6: Cleanup hanging/orphaned processes ────────────────────────────────
 
-// Only kill processes matching these HANGING patterns (inverted logic = safer)
-// cmd.exe /c or /d are non-interactive and will exit on their own → NEVER kill
-// Only target: bare cmd.exe (interactive shell) or Antigravity's broken -c format
-function isHangingProcess(cmdLine, name) {
-  if (name?.toLowerCase() === "conhost.exe") return false; // system-managed
-  if (!cmdLine || cmdLine.trim() === "") return false; // no info, skip
+// Strategy: Kill ALL old cmd.exe EXCEPT MCP infrastructure processes
+// MCP servers are long-running by design and must never be killed
+const MCP_PATTERNS = [
+  /npx\s.*mcp/i, /npx\s.*context7/i, /npx\s.*deepwiki/i,
+  /npx\s.*playwright/i, /npx\s.*mem0/i, /npx\s.*sequential/i,
+  /npx\s.*snyk/i, /npx\s.*pulumi/i, /npx\s.*filesystem/i,
+  /npx\s.*markdown-rules/i, /npx\s.*mcp-remote/i,
+  /mcp-server/i, /context7-mcp/i, /mcp-remote/i,
+  /markdown-rules-mcp/i, /playwright-mcp/i, /mem0-mcp/i,
+  /pulumi-mcp-server/i, /snyk\s+mcp/i,
+  /next\s+dev/i, /vite\s+dev/i, // dev servers (long-running)
+];
 
-  const cl = cmdLine.trim();
-
-  // Bare interactive shell: "C:\WINDOWS\System32\cmd.exe" with no args
-  if (/^("?[A-Z]:\\.*\\cmd\.exe"?\s*)$/i.test(cl)) return true;
-
-  // Antigravity's run_command format: cmd.exe -c "..." (note: -c not /c)
-  if (/cmd\.exe\s+-c\s/i.test(cl)) return true;
-
-  return false;
+function isMcpInfrastructure(cmdLine, name) {
+  if (name?.toLowerCase() === "conhost.exe") return true; // system-managed
+  if (!cmdLine || cmdLine.trim() === "") return true; // unknown = safe
+  return MCP_PATTERNS.some(p => p.test(cmdLine));
 }
 
 server.tool(
@@ -342,8 +343,8 @@ server.tool(
 
         if (!pidNum || pidNum === myPid) continue;
 
-        if (!isHangingProcess(cmdLine, name)) {
-          safe.push(`🛡️ PID ${pidNum} (${name}) - SAFE`);
+        if (isMcpInfrastructure(cmdLine, name)) {
+          safe.push(`🛡️ PID ${pidNum} (${name}) - MCP/SYSTEM`);
           continue;
         }
 
