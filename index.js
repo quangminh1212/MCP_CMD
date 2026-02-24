@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { exec, spawn, execSync } from "child_process";
+import { spawn, execSync } from "child_process";
 
 const server = new McpServer({
   name: "mcp-cmd",
@@ -9,55 +9,80 @@ const server = new McpServer({
 });
 
 /**
- * Anti-hang CMD execution.
- * - Uses child_process.exec with cmd.exe shell for correct quote handling
+ * Force-kill an entire process tree on Windows.
+ * Uses taskkill /T /F (tree kill) first, then fallback individual kill.
+ * Catches all errors silently - this is cleanup code.
+ */
+function forceKillTree(pid) {
+  if (!pid) return;
+  try {
+    execSync(`taskkill /T /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 });
+  } catch (_) {
+    // taskkill /T can fail if the process already exited; try individual kill
+    try { execSync(`taskkill /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
+    catch (_2) { /* process already gone */ }
+  }
+}
+
+/**
+ * Anti-hang CMD execution using spawn (not exec) for full control.
+ * - Spawns cmd.exe /c <command> directly via spawn for proper PID tracking
  * - Closes stdin immediately to prevent interactive prompts from blocking
  * - Kills the entire process tree on timeout (taskkill /T /F /PID)
- * - Caps output buffer to prevent memory issues
+ * - Caps output to prevent memory issues
+ * - Uses spawn instead of exec to avoid exec's unreliable timeout on Windows
  */
 function execCmd(command, options = {}) {
   const cwd = options.cwd || "C:\\Dev";
   const timeoutMs = Math.min(options.timeout || 30000, 300000);
-  const maxBuffer = 10 * 1024 * 1024; // 10MB
+  const maxOutput = 10 * 1024 * 1024; // 10MB
 
   return new Promise((resolve) => {
-    const child = exec(command, {
+    let stdout = "";
+    let stderr = "";
+    let finished = false;
+    let timedOut = false;
+
+    const child = spawn("cmd.exe", ["/c", command], {
       cwd,
-      timeout: timeoutMs,
-      encoding: "utf8",
-      shell: "cmd.exe",
       windowsHide: true,
-      maxBuffer,
-    }, (error, stdout, stderr) => {
-      const parts = [];
-      if (stdout && stdout.trim()) parts.push(stdout.trim());
-      if (stderr && stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
-      if (error && error.killed) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
-      if (error && !error.killed && !stdout && !stderr) parts.push(`[ERROR] ${error.message}`);
-
-      const exitCode = error ? (error.code ?? 1) : 0;
-      parts.push(`[EXIT ${exitCode}]`);
-
-      resolve({
-        content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }],
-      });
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     // Close stdin immediately - prevents interactive prompts from hanging
     child.stdin.end();
 
-    // Extra safety: kill process tree on timeout (exec's built-in timeout
-    // only kills the child, not grandchildren)
-    const treeKillTimer = setTimeout(() => {
-      try {
-        execSync(`taskkill /T /F /PID ${child.pid}`, {
-          windowsHide: true,
-          stdio: "ignore",
-        });
-      } catch (_) { }
-    }, timeoutMs + 500); // slightly after exec's own timeout
+    child.stdout.on("data", (d) => { if (stdout.length < maxOutput) stdout += d.toString(); });
+    child.stderr.on("data", (d) => { if (stderr.length < maxOutput) stderr += d.toString(); });
 
-    child.on("close", () => clearTimeout(treeKillTimer));
+    const timer = setTimeout(() => {
+      if (!finished) {
+        timedOut = true;
+        forceKillTree(child.pid);
+      }
+    }, timeoutMs);
+
+    function done(exitCode) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+
+      const parts = [];
+      if (stdout.trim()) parts.push(stdout.trim());
+      if (stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
+      if (timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
+      else if (exitCode !== 0 && !stdout.trim() && !stderr.trim()) {
+        parts.push(`[ERROR] Process exited with code ${exitCode}`);
+      }
+      parts.push(`[EXIT ${exitCode ?? 1}]`);
+
+      resolve({
+        content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }],
+      });
+    }
+
+    child.on("close", (code) => done(code));
+    child.on("error", (err) => { stderr += err.message; done(1); });
   });
 }
 
@@ -194,8 +219,7 @@ server.tool(
       const timer = setTimeout(() => {
         if (!finished) {
           timedOut = true;
-          try { execSync(`taskkill /T /F /PID ${child.pid}`, { windowsHide: true, stdio: "ignore" }); }
-          catch (_) { child.kill("SIGKILL"); }
+          forceKillTree(child.pid);
         }
       }, timeoutMs);
 
@@ -272,10 +296,13 @@ const MCP_PATTERNS = [
   /npx\s.*playwright/i, /npx\s.*mem0/i, /npx\s.*sequential/i,
   /npx\s.*snyk/i, /npx\s.*pulumi/i, /npx\s.*filesystem/i,
   /npx\s.*markdown-rules/i, /npx\s.*mcp-remote/i,
+  /npx\s.*@modelcontextprotocol/i, /npx\s.*duckduckgo/i,
   /mcp-server/i, /context7-mcp/i, /mcp-remote/i,
   /markdown-rules-mcp/i, /playwright-mcp/i, /mem0-mcp/i,
   /pulumi-mcp-server/i, /snyk\s+mcp/i,
   /next\s+dev/i, /vite\s+dev/i, // dev servers (long-running)
+  /npm\s+run\s+dev/i, /npm-cli\.js.*\s+run\s+dev/i, // npm dev servers
+  /run-driver/i, // playwright-go driver
 ];
 
 function isMcpInfrastructure(cmdLine, name) {
@@ -368,7 +395,7 @@ server.tool(
           killed.push(`🔍 PID ${pidNum} (${name}) - ${ageLabel} old - WOULD KILL [${cmdShort}]`);
         } else {
           try {
-            execSync(`taskkill /T /F /PID ${pidNum}`, { windowsHide: true, stdio: "ignore" });
+            forceKillTree(pidNum);
             killed.push(`💀 PID ${pidNum} (${name}) - ${ageLabel} old - KILLED [${cmdShort}]`);
           } catch (_) {
             killed.push(`⚠️ PID ${pidNum} (${name}) - ${ageLabel} old - FAILED [${cmdShort}]`);
