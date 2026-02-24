@@ -444,7 +444,7 @@ server.tool(
 
 // ─── Background Auto-Reaper ────────────────────────────────────────────────────
 // Periodically scans for orphaned/zombie cmd.exe and powershell.exe processes
-// that slipped past normal cleanup. Runs every 60s, kills processes >30s old.
+// that slipped past normal cleanup. Runs every 30s, kills processes >30s old.
 // Uses unref() so it doesn't prevent Node.js from exiting naturally.
 const _reaperInterval = setInterval(() => {
   try {
@@ -467,7 +467,7 @@ const _reaperInterval = setInterval(() => {
       }
     }
   } catch (_) { /* silent - reaper must never crash the server */ }
-}, 60000);
+}, 30000);
 _reaperInterval.unref();
 
 // ─── Process Exit Cleanup ──────────────────────────────────────────────────────
