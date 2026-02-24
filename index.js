@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { spawn, execSync } from "child_process";
+import { exec, spawn, execSync } from "child_process";
 
 const server = new McpServer({
   name: "mcp-cmd",
@@ -9,8 +9,8 @@ const server = new McpServer({
 });
 
 /**
- * Anti-hang CMD execution using spawn with process isolation.
- * - Spawns cmd.exe /c so the shell exits after command completes
+ * Anti-hang CMD execution.
+ * - Uses child_process.exec with cmd.exe shell for correct quote handling
  * - Closes stdin immediately to prevent interactive prompts from blocking
  * - Kills the entire process tree on timeout (taskkill /T /F /PID)
  * - Caps output buffer to prevent memory issues
@@ -18,67 +18,46 @@ const server = new McpServer({
 function execCmd(command, options = {}) {
   const cwd = options.cwd || "C:\\Dev";
   const timeoutMs = Math.min(options.timeout || 30000, 300000);
-  const maxOutput = options.maxOutput || 5 * 1024 * 1024; // 5MB
+  const maxBuffer = 10 * 1024 * 1024; // 10MB
 
   return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let finished = false;
-    let timedOut = false;
-
-    const child = spawn("cmd.exe", ["/S", "/C", `"${command}"`], {
+    const child = exec(command, {
       cwd,
+      timeout: timeoutMs,
+      encoding: "utf8",
+      shell: "cmd.exe",
       windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
+      maxBuffer,
+    }, (error, stdout, stderr) => {
+      const parts = [];
+      if (stdout && stdout.trim()) parts.push(stdout.trim());
+      if (stderr && stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
+      if (error && error.killed) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
+      if (error && !error.killed && !stdout && !stderr) parts.push(`[ERROR] ${error.message}`);
+
+      const exitCode = error ? (error.code ?? 1) : 0;
+      parts.push(`[EXIT ${exitCode}]`);
+
+      resolve({
+        content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }],
+      });
     });
 
     // Close stdin immediately - prevents interactive prompts from hanging
     child.stdin.end();
 
-    child.stdout.on("data", (data) => {
-      if (stdout.length < maxOutput) stdout += data.toString();
-    });
+    // Extra safety: kill process tree on timeout (exec's built-in timeout
+    // only kills the child, not grandchildren)
+    const treeKillTimer = setTimeout(() => {
+      try {
+        execSync(`taskkill /T /F /PID ${child.pid}`, {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+      } catch (_) { }
+    }, timeoutMs + 500); // slightly after exec's own timeout
 
-    child.stderr.on("data", (data) => {
-      if (stderr.length < maxOutput) stderr += data.toString();
-    });
-
-    const timer = setTimeout(() => {
-      if (!finished) {
-        timedOut = true;
-        // Kill entire process tree to prevent orphans
-        try {
-          execSync(`taskkill /T /F /PID ${child.pid}`, {
-            windowsHide: true,
-            stdio: "ignore",
-          });
-        } catch (_) {
-          child.kill("SIGKILL");
-        }
-      }
-    }, timeoutMs);
-
-    function done(exitCode) {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-
-      const parts = [];
-      if (stdout.trim()) parts.push(stdout.trim());
-      if (stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
-      if (timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
-      parts.push(`[EXIT ${exitCode ?? "?"}]`);
-
-      resolve({
-        content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }],
-      });
-    }
-
-    child.on("close", (code) => done(code));
-    child.on("error", (err) => {
-      stderr += err.message;
-      done(1);
-    });
+    child.on("close", () => clearTimeout(treeKillTimer));
   });
 }
 
@@ -130,7 +109,7 @@ server.tool(
       const { command, cwd } = commands[i];
       const result = await execCmd(command, { cwd, timeout });
       const text = result.content[0].text;
-      const failed = text.includes("[EXIT 1]") || text.includes("[TIMEOUT]");
+      const failed = !text.includes("[EXIT 0]");
 
       results.push(`[${i + 1}/${commands.length}] ${command}\n${text}`);
 
@@ -217,8 +196,10 @@ server.tool(
   "Get basic Windows system info: OS, architecture, memory, username. Quick diagnostic.",
   {},
   async () => {
-    const cmd = 'echo OS: %OS% & echo ARCH: %PROCESSOR_ARCHITECTURE% & echo USER: %USERNAME% & echo SHELL: %COMSPEC%';
-    return execCmd(cmd, { timeout: 15000 });
+    return execCmd(
+      'echo OS: %OS% & echo ARCH: %PROCESSOR_ARCHITECTURE% & echo USER: %USERNAME% & echo SHELL: %COMSPEC% & systeminfo | findstr /B /C:"OS Name" /C:"OS Version" /C:"Total Physical Memory" /C:"Available Physical Memory"',
+      { timeout: 15000 }
+    );
   }
 );
 
