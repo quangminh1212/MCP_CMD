@@ -215,8 +215,10 @@ server.tool(
       .describe("Filter by process name (e.g. 'cmd', 'node'). Defaults to all relevant processes."),
   },
   async ({ filter }) => {
-    const names = filter
-      ? `Name LIKE '%${filter}%'`
+    // Sanitize filter to prevent WMIC injection (allow only alphanumeric, dot, underscore)
+    const sanitized = filter ? filter.replace(/[^a-zA-Z0-9._]/g, "") : "";
+    const names = sanitized
+      ? `Name LIKE '%${sanitized}%'`
       : "Name='cmd.exe' OR Name='conhost.exe' OR Name='powershell.exe' OR Name='node.exe'";
     return execCmd(
       `wmic process where "(${names})" get ProcessId,Name,CreationDate,CommandLine /format:list`,
@@ -344,6 +346,16 @@ server.tool(
   }
 );
 
+// Graceful error handling
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`[MCP_CMD] Unhandled rejection: ${err?.message || err}\n`);
+});
+
 // Start server
-const transport = new StdioServerTransport();
-await server.connect(transport);
+try {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+} catch (err) {
+  process.stderr.write(`[MCP_CMD] Failed to start: ${err.message}\n`);
+  process.exit(1);
+}
