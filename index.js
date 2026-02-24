@@ -227,32 +227,32 @@ server.tool(
 
 // ─── Tool 6: Cleanup hanging/orphaned processes ────────────────────────────────
 
-// Patterns that indicate a process is part of MCP/system infrastructure (NEVER kill)
-const SAFE_PATTERNS = [
-  /npx/i, /mcp/i, /context7/i, /deepwiki/i, /playwright/i,
-  /next\s+dev/i, /vite/i, /turbopack/i, /webpack/i,
-  /node_modules/i, /server-filesystem/i, /markdown-rules/i,
-  /conhost\.exe\s+0x4/i, /conhost\.exe\s+--headless/i,
-  /\\\\system32\\\\conhost/i,
-  /MCP_CMD/i, /index\.js/i,
-  /mem0/i, /sequential-thinking/i, /snyk/i, /pulumi/i,
-];
+// Only kill processes matching these HANGING patterns (inverted logic = safer)
+// cmd.exe /c or /d are non-interactive and will exit on their own → NEVER kill
+// Only target: bare cmd.exe (interactive shell) or Antigravity's broken -c format
+function isHangingProcess(cmdLine, name) {
+  if (name?.toLowerCase() === "conhost.exe") return false; // system-managed
+  if (!cmdLine || cmdLine.trim() === "") return false; // no info, skip
 
-function isSafeProcess(cmdLine, name) {
-  // All conhost.exe are system-managed — skip them entirely
-  if (name?.toLowerCase() === "conhost.exe") return true;
-  if (!cmdLine || cmdLine.trim() === "") return true;
-  return SAFE_PATTERNS.some(p => p.test(cmdLine));
+  const cl = cmdLine.trim();
+
+  // Bare interactive shell: "C:\WINDOWS\System32\cmd.exe" with no args
+  if (/^("?[A-Z]:\\.*\\cmd\.exe"?\s*)$/i.test(cl)) return true;
+
+  // Antigravity's run_command format: cmd.exe -c "..." (note: -c not /c)
+  if (/cmd\.exe\s+-c\s/i.test(cl)) return true;
+
+  return false;
 }
 
 server.tool(
   "process_cleanup",
-  "Find and kill hanging/orphaned cmd.exe and conhost.exe processes. Targets windowless CMD processes older than the specified age (default: 10 seconds). Use this to clean up stale processes left by Antigravity's run_command tool.",
+  "Find and kill hanging/orphaned cmd.exe and conhost.exe processes. Targets windowless CMD processes older than the specified age (default: 30 seconds). Use this to clean up stale processes left by Antigravity's run_command tool.",
   {
     maxAgeSeconds: z
       .number()
       .optional()
-      .describe("Kill processes older than this many seconds. Defaults to 10."),
+      .describe("Kill processes older than this many seconds. Defaults to 30."),
     dryRun: z
       .boolean()
       .optional()
@@ -263,7 +263,7 @@ server.tool(
       .describe("Also clean up orphaned node.exe processes. Defaults to false."),
   },
   async ({ maxAgeSeconds, dryRun, includeNode }) => {
-    const ageLimitSec = maxAgeSeconds ?? 10;
+    const ageLimitSec = maxAgeSeconds ?? 30;
     const isDry = dryRun ?? false;
 
     try {
@@ -294,9 +294,9 @@ server.tool(
 
         if (isNaN(pidNum) || pidNum === myPid) continue;
 
-        // Skip MCP/system/dev infrastructure
-        if (isSafeProcess(cmdLine, name)) {
-          safe.push(`🛡️ PID ${pidNum} (${name}) - PROTECTED`);
+        // Only target processes matching HANGING patterns
+        if (!isHangingProcess(cmdLine, name)) {
+          safe.push(`🛡️ PID ${pidNum} (${name}) - SAFE`);
           continue;
         }
 
