@@ -8,20 +8,33 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
+// ─── Active child process tracking ─────────────────────────────────────────────
+// Tracks all spawned child PIDs so we can force-kill on exit
+const _activeChildren = new Set();
+
 /**
  * Force-kill an entire process tree on Windows.
  * Uses taskkill /T /F (tree kill) first, then fallback individual kill.
- * Catches all errors silently - this is cleanup code.
+ * Verifies the process is actually dead after killing.
  */
 function forceKillTree(pid) {
   if (!pid) return;
   try {
     execSync(`taskkill /T /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 });
   } catch (_) {
-    // taskkill /T can fail if the process already exited; try individual kill
     try { execSync(`taskkill /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
     catch (_2) { /* process already gone */ }
   }
+  // Verify kill - if still alive, retry once after short delay
+  try {
+    const check = execSync(`tasklist /FI "PID eq ${pid}" /NH`, { encoding: "utf8", windowsHide: true, timeout: 3000 });
+    if (check.includes(String(pid))) {
+      // Still alive, force kill again
+      try { execSync(`taskkill /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
+      catch (_) { /* best effort */ }
+    }
+  } catch (_) { /* tasklist failed = process is gone */ }
+  _activeChildren.delete(pid);
 }
 
 /**
@@ -49,6 +62,9 @@ function execCmd(command, options = {}) {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
+    // Track this child for cleanup on exit
+    if (child.pid) _activeChildren.add(child.pid);
+
     // Close stdin immediately - prevents interactive prompts from hanging
     child.stdin.end();
 
@@ -66,6 +82,13 @@ function execCmd(command, options = {}) {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      _activeChildren.delete(child.pid);
+
+      // Deferred orphan cleanup: after cmd.exe exits, its children may linger
+      // Wait 500ms then force-kill the tree to catch any orphaned grandchildren
+      if (!timedOut && child.pid) {
+        setTimeout(() => forceKillTree(child.pid), 500);
+      }
 
       const parts = [];
       if (stdout.trim()) parts.push(stdout.trim());
@@ -211,6 +234,9 @@ server.tool(
         { cwd: workDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
       );
 
+      // Track this child for cleanup on exit
+      if (child.pid) _activeChildren.add(child.pid);
+
       child.stdin.end();
 
       child.stdout.on("data", (d) => { if (stdout.length < maxOutput) stdout += d.toString(); });
@@ -227,6 +253,13 @@ server.tool(
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        _activeChildren.delete(child.pid);
+
+        // Deferred orphan cleanup for PowerShell children
+        if (!timedOut && child.pid) {
+          setTimeout(() => forceKillTree(child.pid), 500);
+        }
+
         const parts = [];
         if (stdout.trim()) parts.push(stdout.trim());
         if (stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
@@ -416,6 +449,47 @@ server.tool(
     }
   }
 );
+
+// ─── Background Auto-Reaper ────────────────────────────────────────────────────
+// Periodically scans for orphaned/zombie cmd.exe and powershell.exe processes
+// that slipped past normal cleanup. Runs every 60s, kills processes >90s old.
+// Uses unref() so it doesn't prevent Node.js from exiting naturally.
+const _reaperInterval = setInterval(() => {
+  try {
+    const script = `@(Get-CimInstance Win32_Process -Filter \"(Name='cmd.exe' OR Name='powershell.exe')\" -EA SilentlyContinue | Select-Object ProcessId, Name, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`;
+    const raw = psSync(script, 8000);
+    if (!raw.trim()) return;
+    const parsed = JSON.parse(raw.trim());
+    const procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+    const now = Date.now();
+    const myPid = process.pid;
+
+    for (const proc of procs) {
+      const pid = proc.ProcessId;
+      if (!pid || pid === myPid) continue;
+      if (isMcpInfrastructure(proc.CommandLine || "", proc.Name || "")) continue;
+
+      const ageMs = now - new Date(proc.Created).getTime();
+      if (ageMs > 90000) { // older than 90 seconds
+        forceKillTree(pid);
+      }
+    }
+  } catch (_) { /* silent - reaper must never crash the server */ }
+}, 60000);
+_reaperInterval.unref();
+
+// ─── Process Exit Cleanup ──────────────────────────────────────────────────────
+// When MCP server exits, kill ALL tracked active children to prevent orphans
+function cleanupOnExit() {
+  for (const pid of _activeChildren) {
+    try { execSync(`taskkill /T /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 3000 }); }
+    catch (_) { /* best effort */ }
+  }
+  _activeChildren.clear();
+}
+process.on("exit", cleanupOnExit);
+process.on("SIGINT", () => { cleanupOnExit(); process.exit(0); });
+process.on("SIGTERM", () => { cleanupOnExit(); process.exit(0); });
 
 // Graceful error handling - prevent MCP server crashes
 process.on("unhandledRejection", (err) => {
