@@ -63,11 +63,16 @@ function execCmd(command, options = {}) {
 
 // Helper: run PowerShell synchronously (replaces deprecated WMIC)
 function psSync(script, timeoutMs = 10000) {
-  const encoded = Buffer.from(script, "utf16le").toString("base64");
-  return execSync(
-    `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
-    { encoding: "utf8", windowsHide: true, timeout: timeoutMs }
-  );
+  try {
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    return execSync(
+      `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+      { encoding: "utf8", windowsHide: true, timeout: timeoutMs }
+    );
+  } catch (err) {
+    // Return empty on failure instead of crashing the MCP server
+    return "";
+  }
 }
 
 // Rate limiter: prevents abuse of process management tools (60 calls/min)
@@ -385,9 +390,12 @@ server.tool(
   }
 );
 
-// Graceful error handling
+// Graceful error handling - prevent MCP server crashes
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`[MCP_CMD] Unhandled rejection: ${err?.message || err}\n`);
+});
+process.on("uncaughtException", (err) => {
+  process.stderr.write(`[MCP_CMD] Uncaught exception: ${err?.message || err}\n`);
 });
 
 // Start server
