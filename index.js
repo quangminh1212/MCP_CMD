@@ -61,6 +61,26 @@ function execCmd(command, options = {}) {
   });
 }
 
+// Helper: run PowerShell synchronously (replaces deprecated WMIC)
+function psSync(script, timeoutMs = 10000) {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  return execSync(
+    `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+    { encoding: "utf8", windowsHide: true, timeout: timeoutMs }
+  );
+}
+
+// Rate limiter: prevents abuse of process management tools (60 calls/min)
+const _rateCalls = new Map();
+function rateCheck(tool) {
+  const now = Date.now();
+  const window = (_rateCalls.get(tool) || []).filter(t => now - t < 60000);
+  if (window.length >= 60) return "[RATE LIMITED] Max 60 calls/min. Try again later.";
+  window.push(now);
+  _rateCalls.set(tool, window);
+  return null;
+}
+
 // ─── Tool 1: Run a single CMD command ──────────────────────────────────────────
 
 server.tool(
@@ -152,6 +172,9 @@ server.tool(
       let finished = false;
       let timedOut = false;
 
+      // SECURITY NOTE: -ExecutionPolicy Bypass is intentional for MCP server operation.
+      // This tool runs in a trusted local context where the AI agent is the caller.
+      // Scripts are Base64-encoded from the agent's command, not from external sources.
       const child = spawn(
         "powershell.exe",
         ["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
@@ -215,15 +238,23 @@ server.tool(
       .describe("Filter by process name (e.g. 'cmd', 'node'). Defaults to all relevant processes."),
   },
   async ({ filter }) => {
-    // Sanitize filter to prevent WMIC injection (allow only alphanumeric, dot, underscore)
+    const rl = rateCheck("process_list");
+    if (rl) return { content: [{ type: "text", text: rl }] };
+
+    // Sanitize filter to prevent injection (allow only alphanumeric, dot, underscore)
     const sanitized = filter ? filter.replace(/[^a-zA-Z0-9._]/g, "") : "";
-    const names = sanitized
+    const filterExpr = sanitized
       ? `Name LIKE '%${sanitized}%'`
       : "Name='cmd.exe' OR Name='conhost.exe' OR Name='powershell.exe' OR Name='node.exe'";
-    return execCmd(
-      `wmic process where "(${names})" get ProcessId,Name,CreationDate,CommandLine /format:list`,
-      { timeout: 10000 }
-    );
+
+    try {
+      // PowerShell Get-CimInstance (replaces deprecated WMIC)
+      const output = psSync(`Get-CimInstance Win32_Process -Filter \"(${filterExpr})\" | Select-Object ProcessId,Name,CreationDate,CommandLine | Format-List`);
+      return { content: [{ type: "text", text: output.trim() || "[NO PROCESSES FOUND]" }] };
+    } catch (_) {
+      // Fallback to WMIC for older Windows versions
+      return execCmd(`wmic process where "(${filterExpr})" get ProcessId,Name,CreationDate,CommandLine /format:list`, { timeout: 10000 });
+    }
   }
 );
 
@@ -268,48 +299,55 @@ server.tool(
     const ageLimitSec = maxAgeSeconds ?? 30;
     const isDry = dryRun ?? false;
 
+    const rl = rateCheck("process_cleanup");
+    if (rl) return { content: [{ type: "text", text: rl }] };
+
     try {
       const targets = ["cmd.exe", "conhost.exe"];
       if (includeNode) targets.push("node.exe");
-
       const nameFilter = targets.map(n => `Name='${n}'`).join(" OR ");
-      const raw = execSync(
-        `wmic process where "(${nameFilter})" get ProcessId,Name,CreationDate,CommandLine /format:csv`,
-        { encoding: "utf8", windowsHide: true, timeout: 10000 }
-      );
 
-      const lines = raw.trim().split("\n").filter(l => l.trim() && !l.startsWith("Node"));
+      // PowerShell Get-CimInstance + JSON (replaces deprecated WMIC + fragile CSV)
+      let procs = [];
+      try {
+        const script = `@(Get-CimInstance Win32_Process -Filter \"(${nameFilter})\" -EA SilentlyContinue | Select-Object ProcessId, Name, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`;
+        const raw = psSync(script);
+        const parsed = JSON.parse(raw.trim() || "[]");
+        procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+      } catch (_) {
+        // Fallback to WMIC for older Windows
+        const raw = execSync(
+          `wmic process where "(${nameFilter})" get ProcessId,Name,CreationDate,CommandLine /format:csv`,
+          { encoding: "utf8", windowsHide: true, timeout: 10000 }
+        );
+        const lines = raw.trim().split("\n").filter(l => l.trim() && !l.startsWith("Node"));
+        for (const line of lines) {
+          const m = line.trim().match(/^([^,]*),(.*),(\d{14}\.\d+\+\d+),([^,]+),(\d+)\s*$/);
+          if (!m) continue;
+          const [, , cmd, dateStr, n, p] = m;
+          const dm = dateStr.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+          if (!dm) continue;
+          procs.push({ ProcessId: parseInt(p), Name: n, Created: new Date(dm[1], dm[2] - 1, dm[3], dm[4], dm[5], dm[6]).toISOString(), CommandLine: cmd });
+        }
+      }
+
       const now = Date.now();
-      const killed = [];
-      const skipped = [];
-      const safe = [];
+      const killed = [], skipped = [], safe = [];
       const myPid = process.pid;
 
-      for (const line of lines) {
-        // CSV: Node,CommandLine,CreationDate,Name,ProcessId
-        // CommandLine may contain commas, so parse fixed fields from the end
-        const m = line.trim().match(/^([^,]*),(.*),(\d{14}\.\d+\+\d+),([^,]+),(\d+)\s*$/);
-        if (!m) continue;
+      for (const proc of procs) {
+        const pidNum = proc.ProcessId;
+        const name = proc.Name || "";
+        const cmdLine = proc.CommandLine || "";
 
-        const [, , cmdLine, creationDate, name, pid] = m;
-        const pidNum = parseInt(pid);
+        if (!pidNum || pidNum === myPid) continue;
 
-        if (isNaN(pidNum) || pidNum === myPid) continue;
-
-        // Only target processes matching HANGING patterns
         if (!isHangingProcess(cmdLine, name)) {
           safe.push(`🛡️ PID ${pidNum} (${name}) - SAFE`);
           continue;
         }
 
-        // Parse WMIC date: 20260224220000.000000+420
-        const match = creationDate.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
-        if (!match) continue;
-
-        const created = new Date(
-          parseInt(match[1]), parseInt(match[2]) - 1, parseInt(match[3]),
-          parseInt(match[4]), parseInt(match[5]), parseInt(match[6])
-        );
+        const created = new Date(proc.Created);
         const ageMs = now - created.getTime();
         const ageSec = Math.round(ageMs / 1000);
         const ageLabel = ageSec >= 60 ? `${Math.round(ageSec / 60)}m${ageSec % 60}s` : `${ageSec}s`;
@@ -336,7 +374,7 @@ server.tool(
       parts.push(`[${isDry ? "DRY RUN" : "CLEANUP"}] Age limit: ${ageLimitSec}s`);
       if (killed.length) parts.push(killed.join("\n"));
       else parts.push("✅ No hanging processes found.");
-      if (safe.length) parts.push(`\n[PROTECTED ${safe.length} MCP/system processes]`);
+      if (safe.length) parts.push(`\n[SAFE ${safe.length} processes]`);
       if (skipped.length) parts.push(`[SKIPPED ${skipped.length} recent processes]`);
 
       return { content: [{ type: "text", text: parts.join("\n") }] };
