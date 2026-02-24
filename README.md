@@ -19,6 +19,8 @@ AI coding assistants often struggle with Windows shell execution — commands ha
 | `cmd_batch` | Run multiple commands sequentially (stops on failure or continues) |
 | `powershell_run` | Run PowerShell with `-NonInteractive -NoProfile -EncodedCommand` |
 | `system_info` | Quick Windows system diagnostic (OS, arch, user) |
+| `process_list` | List running cmd/powershell/node/conhost processes (diagnostic) |
+| `process_cleanup` | Find and kill hanging/orphaned processes by age |
 
 ## Installation
 
@@ -45,7 +47,7 @@ Add to your MCP configuration (e.g. `mcp_config.json`, `claude_desktop_config.js
     "cmd": {
       "command": "node",
       "args": ["C:\\path\\to\\MCP_CMD\\index.js"],
-      "autoApprove": ["cmd_run", "cmd_batch", "powershell_run", "system_info"]
+      "autoApprove": ["cmd_run", "cmd_batch", "powershell_run", "system_info", "process_list", "process_cleanup"]
     }
   }
 }
@@ -109,6 +111,28 @@ The server communicates via **stdio** using the MCP JSON-RPC protocol.
 {
   "name": "system_info",
   "arguments": {}
+}
+```
+
+### process_list
+
+```json
+{
+  "name": "process_list",
+  "arguments": { "filter": "cmd" }
+}
+```
+
+### process_cleanup
+
+```json
+{
+  "name": "process_cleanup",
+  "arguments": {
+    "maxAgeMinutes": 5,
+    "dryRun": false,
+    "includeNode": false
+  }
 }
 ```
 

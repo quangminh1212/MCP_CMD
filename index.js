@@ -203,6 +203,121 @@ server.tool(
   }
 );
 
+// ─── Tool 5: List running processes (diagnostic) ───────────────────────────────
+
+server.tool(
+  "process_list",
+  "List running cmd.exe, powershell.exe, node.exe, and conhost.exe processes. Useful for diagnosing hanging processes before cleanup.",
+  {
+    filter: z
+      .string()
+      .optional()
+      .describe("Filter by process name (e.g. 'cmd', 'node'). Defaults to all relevant processes."),
+  },
+  async ({ filter }) => {
+    const names = filter
+      ? `Name LIKE '%${filter}%'`
+      : "Name='cmd.exe' OR Name='conhost.exe' OR Name='powershell.exe' OR Name='node.exe'";
+    return execCmd(
+      `wmic process where "(${names})" get ProcessId,Name,CreationDate,CommandLine /format:list`,
+      { timeout: 10000 }
+    );
+  }
+);
+
+// ─── Tool 6: Cleanup hanging/orphaned processes ────────────────────────────────
+
+server.tool(
+  "process_cleanup",
+  "Find and kill hanging/orphaned cmd.exe and conhost.exe processes. Targets windowless CMD processes older than the specified age. Use this to clean up stale processes left by Antigravity's run_command tool.",
+  {
+    maxAgeMinutes: z
+      .number()
+      .optional()
+      .describe("Kill processes older than this many minutes. Defaults to 5."),
+    dryRun: z
+      .boolean()
+      .optional()
+      .describe("If true, only list processes without killing them. Defaults to false."),
+    includeNode: z
+      .boolean()
+      .optional()
+      .describe("Also clean up orphaned node.exe processes. Defaults to false."),
+  },
+  async ({ maxAgeMinutes, dryRun, includeNode }) => {
+    const ageLimit = maxAgeMinutes ?? 5;
+    const isDry = dryRun ?? false;
+
+    try {
+      // Get list of cmd.exe and conhost.exe processes with creation time
+      const targets = ["cmd.exe", "conhost.exe"];
+      if (includeNode) targets.push("node.exe");
+
+      const nameFilter = targets.map(n => `Name='${n}'`).join(" OR ");
+      const raw = execSync(
+        `wmic process where "(${nameFilter})" get ProcessId,Name,CreationDate,ParentProcessId /format:csv`,
+        { encoding: "utf8", windowsHide: true, timeout: 10000 }
+      );
+
+      const lines = raw.trim().split("\n").filter(l => l.trim() && !l.startsWith("Node"));
+      const now = Date.now();
+      const killed = [];
+      const skipped = [];
+
+      // Get our own PID and parent to avoid self-kill
+      const myPid = process.pid;
+
+      for (const line of lines) {
+        const cols = line.trim().split(",");
+        if (cols.length < 5) continue;
+
+        const [, creationDate, name, parentPid, pid] = cols;
+        const pidNum = parseInt(pid);
+        const parentPidNum = parseInt(parentPid);
+
+        if (isNaN(pidNum) || pidNum === myPid) continue;
+
+        // Parse WMIC date: 20260224220000.000000+420
+        const match = creationDate.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+        if (!match) continue;
+
+        const created = new Date(
+          parseInt(match[1]), parseInt(match[2]) - 1, parseInt(match[3]),
+          parseInt(match[4]), parseInt(match[5]), parseInt(match[6])
+        );
+        const ageMs = now - created.getTime();
+        const ageMins = Math.round(ageMs / 60000);
+
+        if (ageMins < ageLimit) {
+          skipped.push(`⏭ PID ${pidNum} (${name}) - ${ageMins}min old (under ${ageLimit}min limit)`);
+          continue;
+        }
+
+        if (isDry) {
+          killed.push(`🔍 PID ${pidNum} (${name}) - ${ageMins}min old - WOULD KILL`);
+        } else {
+          try {
+            execSync(`taskkill /T /F /PID ${pidNum}`, { windowsHide: true, stdio: "ignore" });
+            killed.push(`💀 PID ${pidNum} (${name}) - ${ageMins}min old - KILLED`);
+          } catch (_) {
+            killed.push(`⚠️ PID ${pidNum} (${name}) - ${ageMins}min old - KILL FAILED (already dead?)`);
+          }
+        }
+      }
+
+      const parts = [];
+      parts.push(`[${isDry ? "DRY RUN" : "CLEANUP"}] Age limit: ${ageLimit}min`);
+      if (killed.length) parts.push(killed.join("\n"));
+      else parts.push("✅ No hanging processes found.");
+      if (skipped.length) parts.push(`\n[SKIPPED ${skipped.length} recent processes]`);
+
+      return { content: [{ type: "text", text: parts.join("\n") }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: `[ERROR] ${err.message}` }] };
+    }
+  }
+);
+
 // Start server
 const transport = new StdioServerTransport();
 await server.connect(transport);
