@@ -444,7 +444,7 @@ server.tool(
 
 // ─── Background Auto-Reaper ────────────────────────────────────────────────────
 // Periodically scans for orphaned/zombie cmd.exe and powershell.exe processes
-// that slipped past normal cleanup. Runs every 60s, kills processes >60s old.
+// that slipped past normal cleanup. Runs every 60s, kills processes >30s old.
 // Uses unref() so it doesn't prevent Node.js from exiting naturally.
 const _reaperInterval = setInterval(() => {
   try {
@@ -462,7 +462,7 @@ const _reaperInterval = setInterval(() => {
       if (isMcpInfrastructure(proc.CommandLine || "", proc.Name || "")) continue;
 
       const ageMs = now - new Date(proc.Created).getTime();
-      if (ageMs > 60000) { // older than 60 seconds
+      if (ageMs > 30000) { // older than 30 seconds
         forceKillTree(pid);
       }
     }
