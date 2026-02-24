@@ -20,7 +20,7 @@ AI coding assistants often struggle with Windows shell execution — commands ha
 | `powershell_run` | Run PowerShell with `-NonInteractive -NoProfile -EncodedCommand` |
 | `system_info` | Quick Windows system diagnostic (OS, arch, user) |
 | `process_list` | List running cmd/powershell/node/conhost processes (diagnostic) |
-| `process_cleanup` | Find and kill hanging/orphaned processes by age |
+| `process_cleanup` | Find and kill hanging/orphaned processes (default: >10s old) |
 
 ## Installation
 
@@ -129,7 +129,7 @@ The server communicates via **stdio** using the MCP JSON-RPC protocol.
 {
   "name": "process_cleanup",
   "arguments": {
-    "maxAgeMinutes": 5,
+    "maxAgeSeconds": 10,
     "dryRun": false,
     "includeNode": false
   }

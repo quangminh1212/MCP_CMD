@@ -227,14 +227,32 @@ server.tool(
 
 // ─── Tool 6: Cleanup hanging/orphaned processes ────────────────────────────────
 
+// Patterns that indicate a process is part of MCP/system infrastructure (NEVER kill)
+const SAFE_PATTERNS = [
+  /npx/i, /mcp/i, /context7/i, /deepwiki/i, /playwright/i,
+  /next\s+dev/i, /vite/i, /turbopack/i, /webpack/i,
+  /node_modules/i, /server-filesystem/i, /markdown-rules/i,
+  /conhost\.exe\s+0x4/i, /conhost\.exe\s+--headless/i,
+  /\\\\system32\\\\conhost/i,
+  /MCP_CMD/i, /index\.js/i,
+  /mem0/i, /sequential-thinking/i, /snyk/i, /pulumi/i,
+];
+
+function isSafeProcess(cmdLine, name) {
+  // All conhost.exe are system-managed — skip them entirely
+  if (name?.toLowerCase() === "conhost.exe") return true;
+  if (!cmdLine || cmdLine.trim() === "") return true;
+  return SAFE_PATTERNS.some(p => p.test(cmdLine));
+}
+
 server.tool(
   "process_cleanup",
-  "Find and kill hanging/orphaned cmd.exe and conhost.exe processes. Targets windowless CMD processes older than the specified age. Use this to clean up stale processes left by Antigravity's run_command tool.",
+  "Find and kill hanging/orphaned cmd.exe and conhost.exe processes. Targets windowless CMD processes older than the specified age (default: 10 seconds). Use this to clean up stale processes left by Antigravity's run_command tool.",
   {
-    maxAgeMinutes: z
+    maxAgeSeconds: z
       .number()
       .optional()
-      .describe("Kill processes older than this many minutes. Defaults to 5."),
+      .describe("Kill processes older than this many seconds. Defaults to 10."),
     dryRun: z
       .boolean()
       .optional()
@@ -244,18 +262,17 @@ server.tool(
       .optional()
       .describe("Also clean up orphaned node.exe processes. Defaults to false."),
   },
-  async ({ maxAgeMinutes, dryRun, includeNode }) => {
-    const ageLimit = maxAgeMinutes ?? 5;
+  async ({ maxAgeSeconds, dryRun, includeNode }) => {
+    const ageLimitSec = maxAgeSeconds ?? 10;
     const isDry = dryRun ?? false;
 
     try {
-      // Get list of cmd.exe and conhost.exe processes with creation time
       const targets = ["cmd.exe", "conhost.exe"];
       if (includeNode) targets.push("node.exe");
 
       const nameFilter = targets.map(n => `Name='${n}'`).join(" OR ");
       const raw = execSync(
-        `wmic process where "(${nameFilter})" get ProcessId,Name,CreationDate,ParentProcessId /format:csv`,
+        `wmic process where "(${nameFilter})" get ProcessId,Name,CreationDate,CommandLine /format:csv`,
         { encoding: "utf8", windowsHide: true, timeout: 10000 }
       );
 
@@ -263,19 +280,25 @@ server.tool(
       const now = Date.now();
       const killed = [];
       const skipped = [];
-
-      // Get our own PID and parent to avoid self-kill
+      const safe = [];
       const myPid = process.pid;
 
       for (const line of lines) {
-        const cols = line.trim().split(",");
-        if (cols.length < 5) continue;
+        // CSV: Node,CommandLine,CreationDate,Name,ProcessId
+        // CommandLine may contain commas, so parse fixed fields from the end
+        const m = line.trim().match(/^([^,]*),(.*),(\d{14}\.\d+\+\d+),([^,]+),(\d+)\s*$/);
+        if (!m) continue;
 
-        const [, creationDate, name, parentPid, pid] = cols;
+        const [, , cmdLine, creationDate, name, pid] = m;
         const pidNum = parseInt(pid);
-        const parentPidNum = parseInt(parentPid);
 
         if (isNaN(pidNum) || pidNum === myPid) continue;
+
+        // Skip MCP/system/dev infrastructure
+        if (isSafeProcess(cmdLine, name)) {
+          safe.push(`🛡️ PID ${pidNum} (${name}) - PROTECTED`);
+          continue;
+        }
 
         // Parse WMIC date: 20260224220000.000000+420
         const match = creationDate.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
@@ -286,30 +309,33 @@ server.tool(
           parseInt(match[4]), parseInt(match[5]), parseInt(match[6])
         );
         const ageMs = now - created.getTime();
-        const ageMins = Math.round(ageMs / 60000);
+        const ageSec = Math.round(ageMs / 1000);
+        const ageLabel = ageSec >= 60 ? `${Math.round(ageSec / 60)}m${ageSec % 60}s` : `${ageSec}s`;
+        const cmdShort = cmdLine ? cmdLine.substring(0, 60) : "(no cmdline)";
 
-        if (ageMins < ageLimit) {
-          skipped.push(`⏭ PID ${pidNum} (${name}) - ${ageMins}min old (under ${ageLimit}min limit)`);
+        if (ageSec < ageLimitSec) {
+          skipped.push(`⏭ PID ${pidNum} (${name}) - ${ageLabel} old [${cmdShort}]`);
           continue;
         }
 
         if (isDry) {
-          killed.push(`🔍 PID ${pidNum} (${name}) - ${ageMins}min old - WOULD KILL`);
+          killed.push(`🔍 PID ${pidNum} (${name}) - ${ageLabel} old - WOULD KILL [${cmdShort}]`);
         } else {
           try {
             execSync(`taskkill /T /F /PID ${pidNum}`, { windowsHide: true, stdio: "ignore" });
-            killed.push(`💀 PID ${pidNum} (${name}) - ${ageMins}min old - KILLED`);
+            killed.push(`💀 PID ${pidNum} (${name}) - ${ageLabel} old - KILLED [${cmdShort}]`);
           } catch (_) {
-            killed.push(`⚠️ PID ${pidNum} (${name}) - ${ageMins}min old - KILL FAILED (already dead?)`);
+            killed.push(`⚠️ PID ${pidNum} (${name}) - ${ageLabel} old - FAILED [${cmdShort}]`);
           }
         }
       }
 
       const parts = [];
-      parts.push(`[${isDry ? "DRY RUN" : "CLEANUP"}] Age limit: ${ageLimit}min`);
+      parts.push(`[${isDry ? "DRY RUN" : "CLEANUP"}] Age limit: ${ageLimitSec}s`);
       if (killed.length) parts.push(killed.join("\n"));
       else parts.push("✅ No hanging processes found.");
-      if (skipped.length) parts.push(`\n[SKIPPED ${skipped.length} recent processes]`);
+      if (safe.length) parts.push(`\n[PROTECTED ${safe.length} MCP/system processes]`);
+      if (skipped.length) parts.push(`[SKIPPED ${skipped.length} recent processes]`);
 
       return { content: [{ type: "text", text: parts.join("\n") }] };
     } catch (err) {
