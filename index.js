@@ -26,7 +26,7 @@ function execCmd(command, options = {}) {
     let finished = false;
     let timedOut = false;
 
-    const child = spawn("cmd.exe", ["/c", command], {
+    const child = spawn("cmd.exe", ["/S", "/C", `"${command}"`], {
       cwd,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
