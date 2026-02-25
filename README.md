@@ -1,35 +1,42 @@
-# MCP CMD
+# MCP CMD — Chạy lệnh Windows không bao giờ bị treo 🚀
 
-> A lightweight MCP (Model Context Protocol) server for reliable Windows CMD and PowerShell command execution — designed to **never hang**.
+> MCP Server nhẹ, giúp AI assistant (Antigravity, Claude, Gemini CLI...) chạy lệnh CMD & PowerShell trên Windows **an toàn, không bao giờ bị treo**.
 
-## Why?
+**🔗 Repo:** [github.com/quangminh1212/MCP_CMD](https://github.com/quangminh1212/MCP_CMD)
 
-AI coding assistants often struggle with Windows shell execution — commands hang indefinitely due to interactive prompts, stdin blocking, or zombie processes. **MCP CMD** solves this with a purpose-built execution engine:
+---
 
-- **`stdin` closed immediately** — no interactive prompt can block
-- **Process tree kill on timeout** — `taskkill /T /F /PID` eliminates all child processes
-- **Isolated process per command** — each command runs in its own `cmd.exe /c` process
-- **PowerShell via Base64 EncodedCommand** — zero escaping issues
+## Vấn đề gì được giải quyết?
 
-## Tools
+Khi dùng AI coding assistant trên Windows, lệnh shell thường **bị treo vĩnh viễn** do:
+- Prompt chờ nhập liệu (y/n, password...)
+- Process zombie không tự tắt
+- Escape ký tự đặc biệt trong PowerShell
 
-| Tool | Description |
-|------|-------------|
-| `cmd_run` | Run a single CMD command safely |
-| `cmd_batch` | Run multiple commands sequentially (stops on failure or continues) |
-| `powershell_run` | Run PowerShell with `-NonInteractive -NoProfile -EncodedCommand` |
-| `system_info` | Quick Windows system diagnostic (OS, arch, user) |
-| `process_list` | List running cmd/powershell/node/conhost processes (diagnostic) |
-| `process_cleanup` | Find and kill hanging/orphaned processes (default: >10s old) |
+**MCP CMD** xử lý tất cả bằng cách:
+- ✅ Đóng `stdin` ngay lập tức — không prompt nào block được
+- ✅ Tự kill cả process tree khi timeout — không zombie
+- ✅ PowerShell chạy qua Base64 — hết lỗi escape
+- ✅ Output giới hạn 5MB — không tràn bộ nhớ
 
-## Installation
+---
 
-### Prerequisites
+## 6 Tools có sẵn
 
-- [Node.js](https://nodejs.org/) v18+
-- Windows OS
+| Tool | Mô tả |
+|------|--------|
+| `cmd_run` | Chạy 1 lệnh CMD đơn lẻ |
+| `cmd_batch` | Chạy nhiều lệnh tuần tự (dừng khi lỗi hoặc tiếp tục) |
+| `powershell_run` | Chạy PowerShell an toàn, không lỗi escape |
+| `system_info` | Xem thông tin hệ thống (OS, RAM, user) |
+| `process_list` | Liệt kê các process đang chạy |
+| `process_cleanup` | Dọn dẹp process treo/zombie |
 
-### Setup
+---
+
+## Cài đặt nhanh (3 bước)
+
+### 1. Clone & cài đặt
 
 ```bash
 git clone https://github.com/quangminh1212/MCP_CMD.git
@@ -37,9 +44,9 @@ cd MCP_CMD
 npm install
 ```
 
-### Configure in your MCP client
+### 2. Thêm vào MCP config
 
-Add to your MCP configuration (e.g. `mcp_config.json`, `claude_desktop_config.json`, or `.gemini/settings.json`):
+Thêm đoạn sau vào file cấu hình MCP của bạn (ví dụ: `.gemini/settings.json`, `claude_desktop_config.json`):
 
 ```json
 {
@@ -53,17 +60,17 @@ Add to your MCP configuration (e.g. `mcp_config.json`, `claude_desktop_config.js
 }
 ```
 
-### Test
+> ⚠️ Thay `C:\\path\\to\\MCP_CMD` bằng đường dẫn thực tế trên máy bạn.
 
-```bash
-npm start
-```
+### 3. Xong! 🎉
 
-The server communicates via **stdio** using the MCP JSON-RPC protocol.
+AI assistant của bạn giờ có thể chạy lệnh Windows mà **không bao giờ bị treo**.
 
-## Usage Examples
+---
 
-### cmd_run
+## Ví dụ sử dụng
+
+### Chạy lệnh CMD đơn giản
 
 ```json
 {
@@ -76,7 +83,7 @@ The server communicates via **stdio** using the MCP JSON-RPC protocol.
 }
 ```
 
-### cmd_batch
+### Chạy nhiều lệnh liên tiếp
 
 ```json
 {
@@ -93,7 +100,7 @@ The server communicates via **stdio** using the MCP JSON-RPC protocol.
 }
 ```
 
-### powershell_run
+### Chạy PowerShell
 
 ```json
 {
@@ -105,25 +112,7 @@ The server communicates via **stdio** using the MCP JSON-RPC protocol.
 }
 ```
 
-### system_info
-
-```json
-{
-  "name": "system_info",
-  "arguments": {}
-}
-```
-
-### process_list
-
-```json
-{
-  "name": "process_list",
-  "arguments": { "filter": "cmd" }
-}
-```
-
-### process_cleanup
+### Dọn dẹp process treo
 
 ```json
 {
@@ -136,34 +125,41 @@ The server communicates via **stdio** using the MCP JSON-RPC protocol.
 }
 ```
 
-## Anti-Hang Architecture
+---
+
+## Kiến trúc Anti-Hang
 
 ```
 ┌─────────────────────────────────────────────┐
 │  MCP Client (AI Assistant)                  │
-│  Sends JSON-RPC request via stdio           │
+│  Gửi JSON-RPC request qua stdio            │
 └────────────────┬────────────────────────────┘
                  │
 ┌────────────────▼────────────────────────────┐
 │  MCP CMD Server (Node.js)                   │
 │                                             │
 │  1. spawn("cmd.exe", ["/c", command])       │
-│  2. child.stdin.end()  ← close immediately  │
-│  3. Collect stdout/stderr with cap          │
+│  2. child.stdin.end()  ← đóng ngay         │
+│  3. Thu stdout/stderr (giới hạn 5MB)        │
 │  4. setTimeout → taskkill /T /F /PID        │
-│  5. Return result on close/timeout          │
+│  5. Trả kết quả khi xong hoặc timeout      │
 └─────────────────────────────────────────────┘
 ```
 
-**Key protections:**
+| Bảo vệ | Cách thực hiện |
+|---------|---------------|
+| Không treo khi chờ input | `stdin.end()` ngay sau spawn |
+| Không process zombie | `taskkill /T /F /PID` kill cả cây process |
+| Không tràn bộ nhớ | Output giới hạn 5MB |
+| Không popup GUI | `windowsHide: true` |
+| Không lỗi escape PS | PowerShell dùng `-EncodedCommand` (Base64 UTF-16LE) |
 
-| Protection | How |
-|-----------|-----|
-| No hanging on input | `stdin.end()` called immediately after spawn |
-| No zombie processes | `taskkill /T /F /PID` kills entire process tree |
-| No memory overflow | Output capped at 5MB |
-| No GUI popups | `windowsHide: true` |
-| No PS escaping bugs | PowerShell uses `-EncodedCommand` (Base64 UTF-16LE) |
+---
+
+## Yêu cầu
+
+- **Node.js** v18+
+- **Windows** OS
 
 ## License
 
