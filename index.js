@@ -12,31 +12,58 @@ const server = new McpServer({
 // Tracks all spawned child PIDs so we can force-kill on exit
 const _activeChildren = new Set();
 
-// ─── Concurrency limiter ────────────────────────────────────────────────────────
-// Limits simultaneous child processes to prevent zombie accumulation
+// ─── Concurrency limiter (evict-oldest strategy) ────────────────────────────────
+// Max 3 simultaneous child processes. When full, kills the OLDEST to make room.
 const MAX_CONCURRENT = 3;
-let _runningCount = 0;
-const _waitQueue = [];
+const IDLE_TIMEOUT_MS = 30000; // 30s no-output → auto-kill
 
-function acquireSlot() {
-  return new Promise((resolve) => {
-    if (_runningCount < MAX_CONCURRENT) {
-      _runningCount++;
-      resolve();
-    } else {
-      _waitQueue.push(resolve);
-    }
-  });
+// Track running processes with metadata for eviction
+// Each entry: { pid, startedAt, lastOutputAt, kill: () => void }
+const _runningProcs = new Map();
+
+function registerProc(pid, killFn) {
+  const now = Date.now();
+  _runningProcs.set(pid, { pid, startedAt: now, lastOutputAt: now, kill: killFn });
 }
 
-function releaseSlot() {
-  if (_waitQueue.length > 0) {
-    const next = _waitQueue.shift();
-    next(); // don't decrement - pass the slot to next waiter
-  } else {
-    _runningCount--;
+function touchProc(pid) {
+  const entry = _runningProcs.get(pid);
+  if (entry) entry.lastOutputAt = Date.now();
+}
+
+function unregisterProc(pid) {
+  _runningProcs.delete(pid);
+}
+
+/**
+ * Evict oldest running process if at capacity.
+ * Called BEFORE spawning a new process.
+ */
+function evictIfFull() {
+  if (_runningProcs.size < MAX_CONCURRENT) return;
+  // Find the oldest process (earliest startedAt)
+  let oldest = null;
+  for (const entry of _runningProcs.values()) {
+    if (!oldest || entry.startedAt < oldest.startedAt) oldest = entry;
+  }
+  if (oldest) {
+    try { oldest.kill(); } catch (_) { /* best effort */ }
+    _runningProcs.delete(oldest.pid);
   }
 }
+
+// ─── Idle watchdog ──────────────────────────────────────────────────────────────
+// Every 5s, check for processes with no output for 30s → kill them
+const _idleWatchdog = setInterval(() => {
+  const now = Date.now();
+  for (const [pid, entry] of _runningProcs) {
+    if (now - entry.lastOutputAt > IDLE_TIMEOUT_MS) {
+      try { entry.kill(); } catch (_) { /* best effort */ }
+      _runningProcs.delete(pid);
+    }
+  }
+}, 5000);
+_idleWatchdog.unref(); // Don't prevent process exit
 
 /**
  * Force-kill an entire process tree on Windows.
@@ -76,11 +103,10 @@ async function execCmd(command, options = {}) {
   const timeoutMs = Math.max(100, Math.min(options.timeout || 30000, 300000));
   const maxOutput = 10 * 1024 * 1024; // 10MB
 
-  // Wait for a concurrency slot before spawning
-  await acquireSlot();
+  // Evict oldest process if at capacity (instead of queuing)
+  evictIfFull();
 
   return new Promise((resolve) => {
-    // Use Buffer arrays instead of string concat to avoid O(n²) GC pressure
     const stdoutChunks = [];
     const stderrChunks = [];
     let stdoutLen = 0;
@@ -96,7 +122,6 @@ async function execCmd(command, options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (spawnErr) {
-      releaseSlot();
       resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
       return;
     }
@@ -105,12 +130,18 @@ async function execCmd(command, options = {}) {
 
     child.stdin.end();
 
-    child.stdin.on("error", () => { });
-    child.stdout.on("error", () => { });
-    child.stderr.on("error", () => { });
+    child.stdin.on("error", () => {});
+    child.stdout.on("error", () => {});
+    child.stderr.on("error", () => {});
 
-    child.stdout.on("data", (d) => { if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; } });
-    child.stderr.on("data", (d) => { if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; } });
+    child.stdout.on("data", (d) => {
+      if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; }
+      if (child.pid) touchProc(child.pid); // Reset idle timer on output
+    });
+    child.stderr.on("data", (d) => {
+      if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; }
+      if (child.pid) touchProc(child.pid); // Reset idle timer on output
+    });
 
     const timer = setTimeout(() => {
       if (!finished) {
@@ -124,7 +155,7 @@ async function execCmd(command, options = {}) {
       finished = true;
       clearTimeout(timer);
       _activeChildren.delete(child.pid);
-      releaseSlot();
+      unregisterProc(child.pid);
 
       const stdout = Buffer.concat(stdoutChunks).toString().trim();
       const stderr = Buffer.concat(stderrChunks).toString().trim();
@@ -141,6 +172,9 @@ async function execCmd(command, options = {}) {
         content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }],
       });
     }
+
+    // Register for eviction + idle tracking
+    if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid));
 
     child.on("close", (code) => done(code));
     child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
@@ -271,18 +305,17 @@ server.tool(
     const timeoutMs = Math.max(100, Math.min(timeout || 30000, 300000));
     const maxOutput = 5 * 1024 * 1024;
 
-    await acquireSlot();
+    // Evict oldest process if at capacity
+    evictIfFull();
 
     let encoded;
     try {
       encoded = Buffer.from(command, "utf16le").toString("base64");
     } catch (encErr) {
-      releaseSlot();
       return { content: [{ type: "text", text: `[ERROR] Failed to encode command: ${encErr.message}\n[EXIT 1]` }] };
     }
 
     return new Promise((resolve) => {
-      // Use Buffer arrays instead of string concat to avoid O(n²) GC pressure
       const stdoutChunks = [];
       const stderrChunks = [];
       let stdoutLen = 0;
@@ -299,7 +332,6 @@ server.tool(
           { cwd: workDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
         );
       } catch (spawnErr) {
-        releaseSlot();
         resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
         return;
       }
@@ -308,12 +340,18 @@ server.tool(
 
       child.stdin.end();
 
-      child.stdin.on("error", () => { });
-      child.stdout.on("error", () => { });
-      child.stderr.on("error", () => { });
+      child.stdin.on("error", () => {});
+      child.stdout.on("error", () => {});
+      child.stderr.on("error", () => {});
 
-      child.stdout.on("data", (d) => { if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; } });
-      child.stderr.on("data", (d) => { if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; } });
+      child.stdout.on("data", (d) => {
+        if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; }
+        if (child.pid) touchProc(child.pid);
+      });
+      child.stderr.on("data", (d) => {
+        if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; }
+        if (child.pid) touchProc(child.pid);
+      });
 
       const timer = setTimeout(() => {
         if (!finished) {
@@ -327,7 +365,7 @@ server.tool(
         finished = true;
         clearTimeout(timer);
         _activeChildren.delete(child.pid);
-        releaseSlot();
+        unregisterProc(child.pid);
 
         const stdout = Buffer.concat(stdoutChunks).toString().trim();
         const stderr = Buffer.concat(stderrChunks).toString().trim();
@@ -338,6 +376,8 @@ server.tool(
         parts.push(`[EXIT ${exitCode ?? "?"}]`);
         resolve({ content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }] });
       }
+
+      if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid));
 
       child.on("close", (code) => done(code));
       child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
