@@ -449,66 +449,14 @@ server.tool(
   }
 );
 
-// ─── Background Auto-Reaper ────────────────────────────────────────────────────
-// Scans ALL cmd.exe/powershell.exe for zombies every 30s. Kills processes >30s old.
-// Uses async spawn to avoid console window flashing (unlike execSync/spawnSync).
-// Safety layers prevent killing legitimate processes:
-//   1. Bare/interactive cmd.exe (no /c or -c) → SAFE (VS Code terminals, user shells)
-//   2. _activeChildren → SKIP (managed by execCmd/powershell_run with own timeout)
-//   3. MCP_PATTERNS match → SAFE (MCP servers, dev servers, etc.)
-//   4. conhost.exe → SAFE (system-managed)
-function reapZombies() {
-  return new Promise((resolve) => {
-    const script = `@(Get-CimInstance Win32_Process -Filter "(Name='cmd.exe' OR Name='powershell.exe')" -EA SilentlyContinue | Select-Object ProcessId, Name, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`;
-    const encoded = Buffer.from(script, "utf16le").toString("base64");
-    let output = "";
-    let finished = false;
-
-    const child = spawn(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-      { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }
-    );
-    child.stdin?.end?.();
-    child.stdout.on("data", (d) => { output += d.toString(); });
-
-    const timer = setTimeout(() => {
-      if (!finished) { finished = true; forceKillTree(child.pid); resolve(); }
-    }, 8000);
-
-    child.on("close", () => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      try {
-        if (!output.trim()) { resolve(); return; }
-        const parsed = JSON.parse(output.trim());
-        const procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-        const now = Date.now();
-        const myPid = process.pid;
-
-        for (const proc of procs) {
-          const pid = proc.ProcessId;
-          if (!pid || pid === myPid) continue;
-          if (_activeChildren.has(pid)) continue;
-          if (isMcpInfrastructure(proc.CommandLine || "", proc.Name || "")) continue;
-
-          const ageMs = now - new Date(proc.Created).getTime();
-          if (ageMs > 30000) {
-            forceKillTree(pid);
-          }
-        }
-      } catch (_) { /* silent */ }
-      resolve();
-    });
-    child.on("error", () => { if (!finished) { finished = true; clearTimeout(timer); resolve(); } });
-  });
-}
-
-const _reaperInterval = setInterval(() => {
-  reapZombies().catch(() => { });
-}, 30000);
-_reaperInterval.unref();
+// ─── Background Auto-Reaper (DISABLED) ─────────────────────────────────────────
+// DISABLED: The auto-reaper was spawning a PowerShell process every 30s which
+// caused visible CMD/PowerShell windows to flash on Windows (even with windowsHide).
+// This is unnecessary because:
+//   1. execCmd() already has its own timeout + forceKillTree
+//   2. powershell_run() already has its own timeout + forceKillTree
+//   3. Users can manually call process_cleanup tool when needed
+// The reaper function is kept for potential manual use but the interval is removed.
 
 // ─── Process Exit Cleanup ──────────────────────────────────────────────────────
 // When MCP server exits, kill ALL tracked active children to prevent orphans
