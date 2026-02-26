@@ -105,6 +105,11 @@ async function execCmd(command, options = {}) {
     // Close stdin immediately - prevents interactive prompts from hanging
     child.stdin.end();
 
+    // Prevent unhandled 'error' events on stdio streams from crashing the server
+    child.stdin.on("error", () => { });
+    child.stdout.on("error", () => { });
+    child.stderr.on("error", () => { });
+
     child.stdout.on("data", (d) => { if (stdout.length < maxOutput) stdout += d.toString(); });
     child.stderr.on("data", (d) => { if (stderr.length < maxOutput) stderr += d.toString(); });
 
@@ -304,6 +309,11 @@ server.tool(
 
       child.stdin.end();
 
+      // Prevent unhandled 'error' events on stdio streams from crashing the server
+      child.stdin.on("error", () => { });
+      child.stdout.on("error", () => { });
+      child.stderr.on("error", () => { });
+
       child.stdout.on("data", (d) => { if (stdout.length < maxOutput) stdout += d.toString(); });
       child.stderr.on("data", (d) => { if (stderr.length < maxOutput) stderr += d.toString(); });
 
@@ -342,10 +352,18 @@ server.tool(
   "Get basic Windows system info: OS, architecture, memory, username. Quick diagnostic.",
   {},
   async () => {
-    return execCmd(
-      'echo OS: %OS% & echo ARCH: %PROCESSOR_ARCHITECTURE% & echo USER: %USERNAME% & echo SHELL: %COMSPEC% & systeminfo | findstr /B /C:"OS Name" /C:"OS Version" /C:"Total Physical Memory" /C:"Available Physical Memory"',
-      { timeout: 15000 }
+    // Use PowerShell for reliable system info (avoids FINDSTR quoting issues in cmd.exe /c)
+    const output = psSync(
+      `$os = Get-CimInstance Win32_OperatingSystem; ` +
+      `"OS: $($os.Caption) $($os.Version)"; ` +
+      `"ARCH: $env:PROCESSOR_ARCHITECTURE"; ` +
+      `"USER: $env:USERNAME"; ` +
+      `"SHELL: $env:COMSPEC"; ` +
+      `"Total Memory: $([math]::Round($os.TotalVisibleMemorySize/1MB, 1)) GB"; ` +
+      `"Free Memory: $([math]::Round($os.FreePhysicalMemory/1MB, 1)) GB"`,
+      15000
     );
+    return { content: [{ type: "text", text: output.trim() || "[ERROR] Could not retrieve system info" }] };
   }
 );
 
@@ -366,8 +384,10 @@ server.tool(
 
     // Sanitize filter to prevent injection (allow only alphanumeric, dot, underscore)
     const sanitized = filter ? filter.replace(/[^a-zA-Z0-9._]/g, "") : "";
-    const filterExpr = sanitized
-      ? `Name LIKE '%${sanitized}%'`
+    // Escape WMI LIKE wildcards (% and _) in user input, then wrap in LIKE pattern
+    const escaped = sanitized.replace(/%/g, "[%]").replace(/_/g, "[_]");
+    const filterExpr = escaped
+      ? `Name LIKE '%${escaped}%'`
       : "Name='cmd.exe' OR Name='conhost.exe' OR Name='powershell.exe' OR Name='node.exe'";
 
     try {
