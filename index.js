@@ -170,7 +170,6 @@ function rateCheck(tool) {
   const now = Date.now();
   const calls = (_rateCalls.get(tool) || []).filter(t => now - t < 60000);
   if (calls.length >= 60) return "[RATE LIMITED] Max 60 calls/min. Try again later.";
-  if (calls.length === 0) { _rateCalls.delete(tool); return null; } // cleanup stale entries
   calls.push(now);
   _rateCalls.set(tool, calls);
   return null;
