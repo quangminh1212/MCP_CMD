@@ -15,7 +15,7 @@ const _activeChildren = new Set();
 // ─── Concurrency limiter (evict-oldest strategy) ────────────────────────────────
 // Max 3 simultaneous child processes. When full, kills the OLDEST to make room.
 const MAX_CONCURRENT = 3;
-const IDLE_TIMEOUT_MS = 30000; // 30s no-output → auto-kill
+const IDLE_TIMEOUT_MS = 10000; // 10s no-output → auto-kill
 
 // Track running processes with metadata for eviction
 // Each entry: { pid, startedAt, lastOutputAt, kill: () => void }
@@ -53,7 +53,7 @@ function evictIfFull() {
 }
 
 // ─── Idle watchdog ──────────────────────────────────────────────────────────────
-// Every 5s, check for processes with no output for 30s → kill them
+// Every 3s, check for processes with no output for IDLE_TIMEOUT_MS → kill them
 const _idleWatchdog = setInterval(() => {
   const now = Date.now();
   for (const [pid, entry] of _runningProcs) {
@@ -62,7 +62,7 @@ const _idleWatchdog = setInterval(() => {
       _runningProcs.delete(pid);
     }
   }
-}, 5000);
+}, 3000); // Check every 3s for faster response
 _idleWatchdog.unref(); // Don't prevent process exit
 
 /**
@@ -73,20 +73,11 @@ _idleWatchdog.unref(); // Don't prevent process exit
 function forceKillTree(pid) {
   if (!pid) return;
   try {
-    spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 5000 });
+    spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 3000 });
   } catch (_) {
-    try { spawnSync("taskkill", ["/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
+    try { spawnSync("taskkill", ["/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 2000 }); }
     catch (_2) { /* process already gone */ }
   }
-  // Verify kill - if still alive, retry once after short delay
-  try {
-    const check = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH"], { encoding: "utf8", windowsHide: true, timeout: 3000 });
-    if ((check.stdout || "").includes(String(pid))) {
-      // Still alive, force kill again
-      try { spawnSync("taskkill", ["/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
-      catch (_) { /* best effort */ }
-    }
-  } catch (_) { /* tasklist failed = process is gone */ }
   _activeChildren.delete(pid);
 }
 
