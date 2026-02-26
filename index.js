@@ -85,11 +85,19 @@ async function execCmd(command, options = {}) {
     let finished = false;
     let timedOut = false;
 
-    const child = spawn("cmd.exe", ["/c", command], {
-      cwd,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let child;
+    try {
+      child = spawn("cmd.exe", ["/c", command], {
+        cwd,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (spawnErr) {
+      // spawn threw synchronously (e.g. invalid cwd) → release slot and return error
+      releaseSlot();
+      resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
+      return;
+    }
 
     // Track this child for cleanup on exit
     if (child.pid) _activeChildren.add(child.pid);
@@ -261,7 +269,13 @@ server.tool(
     await acquireSlot();
 
     // Encode command as Base64 UTF-16LE to avoid all escaping issues
-    const encoded = Buffer.from(command, "utf16le").toString("base64");
+    let encoded;
+    try {
+      encoded = Buffer.from(command, "utf16le").toString("base64");
+    } catch (encErr) {
+      releaseSlot();
+      return { content: [{ type: "text", text: `[ERROR] Failed to encode command: ${encErr.message}\n[EXIT 1]` }] };
+    }
 
     return new Promise((resolve) => {
       let stdout = "";
@@ -272,11 +286,18 @@ server.tool(
       // SECURITY NOTE: -ExecutionPolicy Bypass is intentional for MCP server operation.
       // This tool runs in a trusted local context where the AI agent is the caller.
       // Scripts are Base64-encoded from the agent's command, not from external sources.
-      const child = spawn(
-        "powershell.exe",
-        ["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-        { cwd: workDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
-      );
+      let child;
+      try {
+        child = spawn(
+          "powershell.exe",
+          ["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+          { cwd: workDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
+        );
+      } catch (spawnErr) {
+        releaseSlot();
+        resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
+        return;
+      }
 
       // Track this child for cleanup on exit
       if (child.pid) _activeChildren.add(child.pid);

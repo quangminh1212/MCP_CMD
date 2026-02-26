@@ -58,11 +58,13 @@ class HeadlessLauncher
         }
 
         // Parse optional timeout from environment variable (seconds, 0 = no timeout)
+        // Range: 0 (disabled) or 1-86400 (max 24 hours) to prevent overflow in Thread.Sleep
         int timeoutSec = 0;
         string timeoutEnv = Environment.GetEnvironmentVariable("HEADLESS_TIMEOUT_SEC");
         if (!string.IsNullOrEmpty(timeoutEnv))
         {
             int.TryParse(timeoutEnv, out timeoutSec);
+            if (timeoutSec < 0 || timeoutSec > 86400) timeoutSec = 0;
         }
 
         try
