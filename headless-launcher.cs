@@ -122,16 +122,14 @@ class HeadlessLauncher
                 try
                 {
                     int ppid = 0;
-                    // Get parent PID using WMI-free approach
+                    // Get parent PID using PowerShell (WMIC is deprecated since Windows 11)
                     try
                     {
                         var currentProc = Process.GetCurrentProcess();
-                        // Use PerformanceCounter or fallback to polling approach
-                        // Simple approach: try to get parent via command line tools
                         var pinfo = new ProcessStartInfo
                         {
-                            FileName = "cmd.exe",
-                            Arguments = "/c wmic process where processid=" + currentProc.Id + " get parentprocessid /value",
+                            FileName = "powershell.exe",
+                            Arguments = "-NoProfile -NonInteractive -Command \"(Get-CimInstance Win32_Process -Filter 'ProcessId=" + currentProc.Id + "').ParentProcessId\"",
                             UseShellExecute = false,
                             CreateNoWindow = true,
                             RedirectStandardOutput = true,
@@ -142,18 +140,9 @@ class HeadlessLauncher
                         if (pp != null)
                         {
                             pp.StandardInput.Close();
-                            string output = pp.StandardOutput.ReadToEnd();
+                            string output = pp.StandardOutput.ReadToEnd().Trim();
                             pp.WaitForExit(5000);
-                            // Parse "ParentProcessId=1234"
-                            foreach (var line in output.Split('\n'))
-                            {
-                                string trimmed = line.Trim();
-                                if (trimmed.StartsWith("ParentProcessId="))
-                                {
-                                    int.TryParse(trimmed.Substring("ParentProcessId=".Length).Trim(), out ppid);
-                                    break;
-                                }
-                            }
+                            int.TryParse(output, out ppid);
                         }
                     }
                     catch { }

@@ -71,7 +71,7 @@ function forceKillTree(pid) {
  * - Caps output to prevent memory issues
  * - Uses spawn instead of exec to avoid exec's unreliable timeout on Windows
  */
-function execCmd(command, options = {}) {
+async function execCmd(command, options = {}) {
   const cwd = options.cwd || "C:\\Dev";
   const timeoutMs = Math.min(options.timeout || 30000, 300000);
   const maxOutput = 10 * 1024 * 1024; // 10MB
@@ -154,11 +154,19 @@ function psSync(script, timeoutMs = 10000) {
 const _rateCalls = new Map();
 function rateCheck(tool) {
   const now = Date.now();
-  const window = (_rateCalls.get(tool) || []).filter(t => now - t < 60000);
-  if (window.length >= 60) return "[RATE LIMITED] Max 60 calls/min. Try again later.";
-  window.push(now);
-  _rateCalls.set(tool, window);
+  const calls = (_rateCalls.get(tool) || []).filter(t => now - t < 60000);
+  if (calls.length >= 60) return "[RATE LIMITED] Max 60 calls/min. Try again later.";
+  calls.push(now);
+  _rateCalls.set(tool, calls);
   return null;
+}
+
+// Validate working directory to prevent path traversal
+function validateCwd(cwd) {
+  if (!cwd) return "C:\\Dev";
+  // Block null bytes and suspicious path components
+  if (cwd.includes('\0')) return "C:\\Dev";
+  return cwd;
 }
 
 // ─── Tool 1: Run a single CMD command ──────────────────────────────────────────
@@ -175,7 +183,7 @@ server.tool(
       .describe("Timeout in ms. Defaults to 30000 (30s). Max 300000 (5min)."),
   },
   async ({ command, cwd, timeout }) => {
-    return execCmd(command, { cwd, timeout });
+    return execCmd(command, { cwd: validateCwd(cwd), timeout });
   }
 );
 
@@ -203,11 +211,17 @@ server.tool(
       .describe("Continue running after a command fails. Defaults to false."),
   },
   async ({ commands, timeout, continueOnError }) => {
+    // Cap batch size to prevent resource exhaustion
+    const maxBatch = 20;
+    if (commands.length > maxBatch) {
+      return { content: [{ type: "text", text: `[ERROR] Max ${maxBatch} commands per batch. Got ${commands.length}.` }] };
+    }
+
     const results = [];
 
     for (let i = 0; i < commands.length; i++) {
       const { command, cwd } = commands[i];
-      const result = await execCmd(command, { cwd, timeout });
+      const result = await execCmd(command, { cwd: validateCwd(cwd), timeout });
       const text = result.content[0].text;
       const failed = !text.includes("[EXIT 0]");
 
@@ -239,9 +253,12 @@ server.tool(
       .describe("Timeout in ms. Defaults to 30000. Max 300000."),
   },
   async ({ command, cwd, timeout }) => {
-    const workDir = cwd || "C:\\Dev";
+    const workDir = validateCwd(cwd);
     const timeoutMs = Math.min(timeout || 30000, 300000);
     const maxOutput = 5 * 1024 * 1024;
+
+    // Concurrency control for PowerShell too
+    await acquireSlot();
 
     // Encode command as Base64 UTF-16LE to avoid all escaping issues
     const encoded = Buffer.from(command, "utf16le").toString("base64");
@@ -281,6 +298,7 @@ server.tool(
         finished = true;
         clearTimeout(timer);
         _activeChildren.delete(child.pid);
+        releaseSlot();
 
         const parts = [];
         if (stdout.trim()) parts.push(stdout.trim());
