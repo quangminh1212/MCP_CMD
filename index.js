@@ -12,6 +12,32 @@ const server = new McpServer({
 // Tracks all spawned child PIDs so we can force-kill on exit
 const _activeChildren = new Set();
 
+// ─── Concurrency limiter ────────────────────────────────────────────────────────
+// Limits simultaneous child processes to prevent zombie accumulation
+const MAX_CONCURRENT = 3;
+let _runningCount = 0;
+const _waitQueue = [];
+
+function acquireSlot() {
+  return new Promise((resolve) => {
+    if (_runningCount < MAX_CONCURRENT) {
+      _runningCount++;
+      resolve();
+    } else {
+      _waitQueue.push(resolve);
+    }
+  });
+}
+
+function releaseSlot() {
+  if (_waitQueue.length > 0) {
+    const next = _waitQueue.shift();
+    next(); // don't decrement - pass the slot to next waiter
+  } else {
+    _runningCount--;
+  }
+}
+
 /**
  * Force-kill an entire process tree on Windows.
  * Uses taskkill /T /F (tree kill) first, then fallback individual kill.
@@ -50,6 +76,9 @@ function execCmd(command, options = {}) {
   const timeoutMs = Math.min(options.timeout || 30000, 300000);
   const maxOutput = 10 * 1024 * 1024; // 10MB
 
+  // Wait for a concurrency slot before spawning
+  await acquireSlot();
+
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -83,6 +112,7 @@ function execCmd(command, options = {}) {
       finished = true;
       clearTimeout(timer);
       _activeChildren.delete(child.pid);
+      releaseSlot();
 
       const parts = [];
       if (stdout.trim()) parts.push(stdout.trim());
