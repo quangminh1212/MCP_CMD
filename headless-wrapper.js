@@ -59,9 +59,12 @@ function resolveCommand(cmd) {
  * Kill entire process tree on Windows using taskkill /T /F.
  * child.kill() on Windows only kills the direct process, NOT its children.
  * This causes zombie cmd.exe/node.exe processes when the wrapper exits.
+ * Guard against double-kill from both signal handler and exit handler.
  */
+let _killed = false;
 function forceKillTree(pid) {
-    if (!pid) return;
+    if (!pid || _killed) return;
+    _killed = true;
     try {
         spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
             windowsHide: true, stdio: "ignore", timeout: 5000
