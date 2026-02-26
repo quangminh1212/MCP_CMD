@@ -68,6 +68,9 @@ const child = spawn(resolved.command, args, {
 });
 
 // Transparent STDIO proxy - critical for MCP STDIO transport
+// Handle EPIPE errors when child terminates while data is being piped
+process.stdin.on("error", () => { });
+child.stdin.on("error", () => { });
 process.stdin.pipe(child.stdin);
 child.stdout.pipe(process.stdout);
 child.stderr.pipe(process.stderr);
