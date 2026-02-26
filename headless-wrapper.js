@@ -14,11 +14,11 @@
  * 2. Spawns the target command with windowsHide: true
  * 3. Pipes STDIO transparently (required for MCP protocol)
  * 4. Forwards exit codes properly
+ * 5. Kills entire process tree on exit (anti-zombie)
  */
 
 import { spawn, spawnSync } from "child_process";
 import { existsSync } from "fs";
-import { join, dirname, resolve as pathResolve } from "path";
 
 // Parse arguments: first arg after script is the command, rest are args
 const [command, ...args] = process.argv.slice(2);
@@ -48,12 +48,28 @@ function resolveCommand(cmd) {
     const needsShell = ['npx', 'npm', 'yarn', 'pnpm', 'pip', 'uv', 'uvx'];
 
     if (needsShell.includes(cmd.toLowerCase())) {
-        // Use cmd.exe /c to resolve .cmd/.ps1 files, but windowsHide will hide it
         return { command: cmd, useShell: true };
     }
 
     // For python, pythonw, node, etc. - direct executable
     return { command: cmd, useShell: false };
+}
+
+/**
+ * Kill entire process tree on Windows using taskkill /T /F.
+ * child.kill() on Windows only kills the direct process, NOT its children.
+ * This causes zombie cmd.exe/node.exe processes when the wrapper exits.
+ */
+function forceKillTree(pid) {
+    if (!pid) return;
+    try {
+        spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
+            windowsHide: true, stdio: "ignore", timeout: 5000
+        });
+    } catch (_) {
+        // Fallback: try killing just the process
+        try { process.kill(pid, "SIGKILL"); } catch (_2) { /* already dead */ }
+    }
 }
 
 const resolved = resolveCommand(command);
@@ -64,19 +80,22 @@ const child = spawn(resolved.command, args, {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
     shell: resolved.useShell,
-    env: { ...process.env },
+    // Inherit env directly (no need to spread, spawn inherits by default)
 });
 
 // Transparent STDIO proxy - critical for MCP STDIO transport
 // Handle EPIPE errors when child terminates while data is being piped
 process.stdin.on("error", () => { });
 child.stdin.on("error", () => { });
+child.stdout.on("error", () => { });
+child.stderr.on("error", () => { });
 process.stdin.pipe(child.stdin);
 child.stdout.pipe(process.stdout);
 child.stderr.pipe(process.stderr);
 
-// Forward exit code
+// Forward exit code + unpipe stdin to prevent backpressure
 child.on("close", (code) => {
+    process.stdin.unpipe(child.stdin);
     process.exit(code ?? 1);
 });
 
@@ -85,10 +104,20 @@ child.on("error", (err) => {
     process.exit(1);
 });
 
-// Cleanup on parent exit
+// Anti-zombie: kill entire process TREE on parent exit signals
+// child.kill("SIGINT") only kills the direct child on Windows,
+// leaving grandchild processes (node.exe, python.exe etc.) as zombies.
 process.on("SIGINT", () => {
-    child.kill("SIGINT");
+    forceKillTree(child.pid);
+    process.exit(0);
 });
 process.on("SIGTERM", () => {
-    child.kill("SIGTERM");
+    forceKillTree(child.pid);
+    process.exit(0);
+});
+
+// Safety net: if process exits without signal (e.g. parent pipe closed),
+// ensure child tree is cleaned up
+process.on("exit", () => {
+    forceKillTree(child.pid);
 });
