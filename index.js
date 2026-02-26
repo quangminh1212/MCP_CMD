@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { spawn, execSync } from "child_process";
+import { spawn, spawnSync } from "child_process";
 
 const server = new McpServer({
   name: "mcp-cmd",
@@ -20,17 +20,17 @@ const _activeChildren = new Set();
 function forceKillTree(pid) {
   if (!pid) return;
   try {
-    execSync(`taskkill /T /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 });
+    spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 5000 });
   } catch (_) {
-    try { execSync(`taskkill /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
+    try { spawnSync("taskkill", ["/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
     catch (_2) { /* process already gone */ }
   }
   // Verify kill - if still alive, retry once after short delay
   try {
-    const check = execSync(`tasklist /FI "PID eq ${pid}" /NH`, { encoding: "utf8", windowsHide: true, timeout: 3000 });
-    if (check.includes(String(pid))) {
+    const check = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH"], { encoding: "utf8", windowsHide: true, timeout: 3000 });
+    if ((check.stdout || "").includes(String(pid))) {
       // Still alive, force kill again
-      try { execSync(`taskkill /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
+      try { spawnSync("taskkill", ["/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 5000 }); }
       catch (_) { /* best effort */ }
     }
   } catch (_) { /* tasklist failed = process is gone */ }
@@ -104,13 +104,16 @@ function execCmd(command, options = {}) {
 }
 
 // Helper: run PowerShell synchronously (replaces deprecated WMIC)
+// Uses spawnSync with argv array for reliable windowsHide (no console flash)
 function psSync(script, timeoutMs = 10000) {
   try {
     const encoded = Buffer.from(script, "utf16le").toString("base64");
-    return execSync(
-      `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
-      { encoding: "utf8", windowsHide: true, timeout: timeoutMs }
+    const result = spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+      { encoding: "utf8", windowsHide: true, timeout: timeoutMs, stdio: ["ignore", "pipe", "pipe"] }
     );
+    return result.stdout || "";
   } catch (err) {
     // Return empty on failure instead of crashing the MCP server
     return "";
@@ -374,19 +377,23 @@ server.tool(
         procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
       } catch (_) {
         // Fallback to WMIC for older Windows
-        const raw = execSync(
-          `wmic process where "(${nameFilter})" get ProcessId,Name,CreationDate,CommandLine /format:csv`,
-          { encoding: "utf8", windowsHide: true, timeout: 10000 }
-        );
-        const lines = raw.trim().split("\n").filter(l => l.trim() && !l.startsWith("Node"));
-        for (const line of lines) {
-          const m = line.trim().match(/^([^,]*),(.*),(\d{14}\.\d+\+\d+),([^,]+),(\d+)\s*$/);
-          if (!m) continue;
-          const [, , cmd, dateStr, n, p] = m;
-          const dm = dateStr.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
-          if (!dm) continue;
-          procs.push({ ProcessId: parseInt(p), Name: n, Created: new Date(dm[1], dm[2] - 1, dm[3], dm[4], dm[5], dm[6]).toISOString(), CommandLine: cmd });
-        }
+        try {
+          const wmicResult = spawnSync(
+            "wmic",
+            ["process", "where", `(${nameFilter})`, "get", "ProcessId,Name,CreationDate,CommandLine", "/format:csv"],
+            { encoding: "utf8", windowsHide: true, timeout: 10000, stdio: ["ignore", "pipe", "pipe"] }
+          );
+          const raw = wmicResult.stdout || "";
+          const lines = raw.trim().split("\n").filter(l => l.trim() && !l.startsWith("Node"));
+          for (const line of lines) {
+            const m = line.trim().match(/^([^,]*),(.*),(\d{14}\.\d+\+\d+),([^,]+),(\d+)\s*$/);
+            if (!m) continue;
+            const [, , cmd, dateStr, n, p] = m;
+            const dm = dateStr.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+            if (!dm) continue;
+            procs.push({ ProcessId: parseInt(p), Name: n, Created: new Date(dm[1], dm[2] - 1, dm[3], dm[4], dm[5], dm[6]).toISOString(), CommandLine: cmd });
+          }
+        } catch (_2) { /* both PowerShell and WMIC failed */ }
       }
 
       const now = Date.now();
@@ -444,35 +451,62 @@ server.tool(
 
 // ─── Background Auto-Reaper ────────────────────────────────────────────────────
 // Scans ALL cmd.exe/powershell.exe for zombies every 30s. Kills processes >30s old.
+// Uses async spawn to avoid console window flashing (unlike execSync/spawnSync).
 // Safety layers prevent killing legitimate processes:
 //   1. Bare/interactive cmd.exe (no /c or -c) → SAFE (VS Code terminals, user shells)
 //   2. _activeChildren → SKIP (managed by execCmd/powershell_run with own timeout)
 //   3. MCP_PATTERNS match → SAFE (MCP servers, dev servers, etc.)
 //   4. conhost.exe → SAFE (system-managed)
-const _reaperInterval = setInterval(() => {
-  try {
+function reapZombies() {
+  return new Promise((resolve) => {
     const script = `@(Get-CimInstance Win32_Process -Filter "(Name='cmd.exe' OR Name='powershell.exe')" -EA SilentlyContinue | Select-Object ProcessId, Name, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`;
-    const raw = psSync(script, 8000);
-    if (!raw.trim()) return;
-    const parsed = JSON.parse(raw.trim());
-    const procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-    const now = Date.now();
-    const myPid = process.pid;
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    let output = "";
+    let finished = false;
 
-    for (const proc of procs) {
-      const pid = proc.ProcessId;
-      if (!pid || pid === myPid) continue;
-      // Skip processes we're actively managing
-      if (_activeChildren.has(pid)) continue;
-      // Skip safe processes (MCP, bare shells, dev servers, etc.)
-      if (isMcpInfrastructure(proc.CommandLine || "", proc.Name || "")) continue;
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+      { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] }
+    );
+    child.stdin?.end?.();
+    child.stdout.on("data", (d) => { output += d.toString(); });
 
-      const ageMs = now - new Date(proc.Created).getTime();
-      if (ageMs > 30000) { // older than 30 seconds
-        forceKillTree(pid);
-      }
-    }
-  } catch (_) { /* silent - reaper must never crash the server */ }
+    const timer = setTimeout(() => {
+      if (!finished) { finished = true; forceKillTree(child.pid); resolve(); }
+    }, 8000);
+
+    child.on("close", () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      try {
+        if (!output.trim()) { resolve(); return; }
+        const parsed = JSON.parse(output.trim());
+        const procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+        const now = Date.now();
+        const myPid = process.pid;
+
+        for (const proc of procs) {
+          const pid = proc.ProcessId;
+          if (!pid || pid === myPid) continue;
+          if (_activeChildren.has(pid)) continue;
+          if (isMcpInfrastructure(proc.CommandLine || "", proc.Name || "")) continue;
+
+          const ageMs = now - new Date(proc.Created).getTime();
+          if (ageMs > 30000) {
+            forceKillTree(pid);
+          }
+        }
+      } catch (_) { /* silent */ }
+      resolve();
+    });
+    child.on("error", () => { if (!finished) { finished = true; clearTimeout(timer); resolve(); } });
+  });
+}
+
+const _reaperInterval = setInterval(() => {
+  reapZombies().catch(() => { });
 }, 30000);
 _reaperInterval.unref();
 
@@ -480,7 +514,7 @@ _reaperInterval.unref();
 // When MCP server exits, kill ALL tracked active children to prevent orphans
 function cleanupOnExit() {
   for (const pid of _activeChildren) {
-    try { execSync(`taskkill /T /F /PID ${pid}`, { windowsHide: true, stdio: "ignore", timeout: 3000 }); }
+    try { spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], { windowsHide: true, stdio: "ignore", timeout: 3000 }); }
     catch (_) { /* best effort */ }
   }
   _activeChildren.clear();
