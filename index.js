@@ -73,15 +73,18 @@ function forceKillTree(pid) {
  */
 async function execCmd(command, options = {}) {
   const cwd = options.cwd || "C:\\Dev";
-  const timeoutMs = Math.min(options.timeout || 30000, 300000);
+  const timeoutMs = Math.max(100, Math.min(options.timeout || 30000, 300000));
   const maxOutput = 10 * 1024 * 1024; // 10MB
 
   // Wait for a concurrency slot before spawning
   await acquireSlot();
 
   return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
+    // Use Buffer arrays instead of string concat to avoid O(n²) GC pressure
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutLen = 0;
+    let stderrLen = 0;
     let finished = false;
     let timedOut = false;
 
@@ -93,25 +96,21 @@ async function execCmd(command, options = {}) {
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (spawnErr) {
-      // spawn threw synchronously (e.g. invalid cwd) → release slot and return error
       releaseSlot();
       resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
       return;
     }
 
-    // Track this child for cleanup on exit
     if (child.pid) _activeChildren.add(child.pid);
 
-    // Close stdin immediately - prevents interactive prompts from hanging
     child.stdin.end();
 
-    // Prevent unhandled 'error' events on stdio streams from crashing the server
     child.stdin.on("error", () => { });
     child.stdout.on("error", () => { });
     child.stderr.on("error", () => { });
 
-    child.stdout.on("data", (d) => { if (stdout.length < maxOutput) stdout += d.toString(); });
-    child.stderr.on("data", (d) => { if (stderr.length < maxOutput) stderr += d.toString(); });
+    child.stdout.on("data", (d) => { if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; } });
+    child.stderr.on("data", (d) => { if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; } });
 
     const timer = setTimeout(() => {
       if (!finished) {
@@ -127,11 +126,13 @@ async function execCmd(command, options = {}) {
       _activeChildren.delete(child.pid);
       releaseSlot();
 
+      const stdout = Buffer.concat(stdoutChunks).toString().trim();
+      const stderr = Buffer.concat(stderrChunks).toString().trim();
       const parts = [];
-      if (stdout.trim()) parts.push(stdout.trim());
-      if (stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
+      if (stdout) parts.push(stdout);
+      if (stderr) parts.push(`[STDERR] ${stderr}`);
       if (timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
-      else if (exitCode !== 0 && !stdout.trim() && !stderr.trim()) {
+      else if (exitCode !== 0 && !stdout && !stderr) {
         parts.push(`[ERROR] Process exited with code ${exitCode}`);
       }
       parts.push(`[EXIT ${exitCode ?? 1}]`);
@@ -142,7 +143,7 @@ async function execCmd(command, options = {}) {
     }
 
     child.on("close", (code) => done(code));
-    child.on("error", (err) => { stderr += err.message; done(1); });
+    child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
   });
 }
 
@@ -169,6 +170,7 @@ function rateCheck(tool) {
   const now = Date.now();
   const calls = (_rateCalls.get(tool) || []).filter(t => now - t < 60000);
   if (calls.length >= 60) return "[RATE LIMITED] Max 60 calls/min. Try again later.";
+  if (calls.length === 0) { _rateCalls.delete(tool); return null; } // cleanup stale entries
   calls.push(now);
   _rateCalls.set(tool, calls);
   return null;
@@ -267,13 +269,11 @@ server.tool(
   },
   async ({ command, cwd, timeout }) => {
     const workDir = validateCwd(cwd);
-    const timeoutMs = Math.min(timeout || 30000, 300000);
+    const timeoutMs = Math.max(100, Math.min(timeout || 30000, 300000));
     const maxOutput = 5 * 1024 * 1024;
 
-    // Concurrency control for PowerShell too
     await acquireSlot();
 
-    // Encode command as Base64 UTF-16LE to avoid all escaping issues
     let encoded;
     try {
       encoded = Buffer.from(command, "utf16le").toString("base64");
@@ -283,14 +283,15 @@ server.tool(
     }
 
     return new Promise((resolve) => {
-      let stdout = "";
-      let stderr = "";
+      // Use Buffer arrays instead of string concat to avoid O(n²) GC pressure
+      const stdoutChunks = [];
+      const stderrChunks = [];
+      let stdoutLen = 0;
+      let stderrLen = 0;
       let finished = false;
       let timedOut = false;
 
       // SECURITY NOTE: -ExecutionPolicy Bypass is intentional for MCP server operation.
-      // This tool runs in a trusted local context where the AI agent is the caller.
-      // Scripts are Base64-encoded from the agent's command, not from external sources.
       let child;
       try {
         child = spawn(
@@ -304,18 +305,16 @@ server.tool(
         return;
       }
 
-      // Track this child for cleanup on exit
       if (child.pid) _activeChildren.add(child.pid);
 
       child.stdin.end();
 
-      // Prevent unhandled 'error' events on stdio streams from crashing the server
       child.stdin.on("error", () => { });
       child.stdout.on("error", () => { });
       child.stderr.on("error", () => { });
 
-      child.stdout.on("data", (d) => { if (stdout.length < maxOutput) stdout += d.toString(); });
-      child.stderr.on("data", (d) => { if (stderr.length < maxOutput) stderr += d.toString(); });
+      child.stdout.on("data", (d) => { if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; } });
+      child.stderr.on("data", (d) => { if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; } });
 
       const timer = setTimeout(() => {
         if (!finished) {
@@ -331,16 +330,18 @@ server.tool(
         _activeChildren.delete(child.pid);
         releaseSlot();
 
+        const stdout = Buffer.concat(stdoutChunks).toString().trim();
+        const stderr = Buffer.concat(stderrChunks).toString().trim();
         const parts = [];
-        if (stdout.trim()) parts.push(stdout.trim());
-        if (stderr.trim()) parts.push(`[STDERR] ${stderr.trim()}`);
+        if (stdout) parts.push(stdout);
+        if (stderr) parts.push(`[STDERR] ${stderr}`);
         if (timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
         parts.push(`[EXIT ${exitCode ?? "?"}]`);
         resolve({ content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }] });
       }
 
       child.on("close", (code) => done(code));
-      child.on("error", (err) => { stderr += err.message; done(1); });
+      child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
     });
   }
 );
