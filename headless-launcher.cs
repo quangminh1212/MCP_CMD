@@ -138,13 +138,15 @@ class HeadlessLauncher
                             RedirectStandardInput = true,
                             RedirectStandardError = true,
                         };
-                        var pp = Process.Start(pinfo);
-                        if (pp != null)
+                        using (var pp = Process.Start(pinfo))
                         {
-                            pp.StandardInput.Close();
-                            string output = pp.StandardOutput.ReadToEnd().Trim();
-                            pp.WaitForExit(5000);
-                            int.TryParse(output, out ppid);
+                            if (pp != null)
+                            {
+                                pp.StandardInput.Close();
+                                string output = pp.StandardOutput.ReadToEnd().Trim();
+                                pp.WaitForExit(5000);
+                                int.TryParse(output, out ppid);
+                            }
                         }
                     }
                     catch { }
@@ -155,27 +157,32 @@ class HeadlessLauncher
                     try { parentProcess = Process.GetProcessById(ppid); }
                     catch { return; } // Parent already gone
 
-                    // Poll every 3 seconds to check if parent is still alive
-                    while (!_exiting)
+                    try
                     {
-                        Thread.Sleep(3000);
-                        try
+                        // Poll every 3 seconds to check if parent is still alive
+                        while (!_exiting)
                         {
-                            if (parentProcess.HasExited)
+                            Thread.Sleep(3000);
+                            try
                             {
-                                // Parent died → kill child tree and exit
+                                if (parentProcess.HasExited)
+                                {
+                                    KillChildTree();
+                                    Environment.Exit(1);
+                                    return;
+                                }
+                            }
+                            catch
+                            {
                                 KillChildTree();
                                 Environment.Exit(1);
                                 return;
                             }
                         }
-                        catch
-                        {
-                            // Can't access parent → assume dead
-                            KillChildTree();
-                            Environment.Exit(1);
-                            return;
-                        }
+                    }
+                    finally
+                    {
+                        parentProcess?.Dispose();
                     }
                 }
                 catch { }
@@ -263,11 +270,14 @@ class HeadlessLauncher
             process.WaitForExit();
             _exiting = true;
 
-            // Give output pipes time to flush
+            // Give ALL pipe threads time to flush (including stdin)
+            stdinThread.Join(2000);
             stdoutThread.Join(3000);
             stderrThread.Join(3000);
 
-            return process.ExitCode;
+            int exitCode = process.ExitCode;
+            process.Dispose();
+            return exitCode;
         }
         catch
         {
@@ -300,11 +310,13 @@ class HeadlessLauncher
                     RedirectStandardError = true,
                     RedirectStandardInput = true,
                 };
-                var killer = Process.Start(killInfo);
-                if (killer != null)
+                using (var killer = Process.Start(killInfo))
                 {
-                    killer.StandardInput.Close();
-                    killer.WaitForExit(5000);
+                    if (killer != null)
+                    {
+                        killer.StandardInput.Close();
+                        killer.WaitForExit(5000);
+                    }
                 }
             }
         }
