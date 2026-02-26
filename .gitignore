@@ -1,3 +1,5 @@
 node_modules/
 *.log
 headless-launcher.exe
+headless-launcher-old.exe
+headless-launcher-new.exe
