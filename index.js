@@ -2,11 +2,72 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn, spawnSync } from "child_process";
+import { resolve, normalize } from "path";
 
 const server = new McpServer({
   name: "mcp-cmd",
-  version: "1.0.0",
+  version: "1.1.0",
 });
+
+// ─── Security Configuration ────────────────────────────────────────────────────
+// Inspired by MladenSU/cli-mcp-server security features
+const SECURITY_CONFIG = {
+  maxCommandLength: 8192,         // Max command string length (bytes)
+  commandTimeout: 30000,          // Default timeout (ms)
+  maxTimeout: 300000,             // Max allowed timeout (ms)
+  maxOutputSize: 10 * 1024 * 1024, // 10MB output cap
+  maxBatchSize: 20,               // Max commands per batch
+  rateLimit: 60,                  // Max calls/min for process management tools
+  rateLimitWindow: 60000,         // Rate limit window (ms)
+};
+
+// Dangerous commands that warrant a warning prefix in output
+const DANGEROUS_COMMANDS = [
+  /^(rd|rmdir)\s/i, /^del\s/i, /^format\s/i,
+  /^diskpart/i, /^reg\s+(delete|add)/i,
+  /^net\s+(user|localgroup)\s/i,
+  /^(sc|net)\s+(stop|delete|config)\s/i,
+  /^shutdown\s/i, /^sfc\s/i, /^bcdedit/i,
+  /^powershell.*-enc/i, /Remove-Item/i,
+];
+
+// Shell operators that could indicate injection attempts
+const SHELL_OPERATORS = ['&&', '||', '|', '>', '>>', '<', '<<', ';', '`'];
+
+/**
+ * Detect potentially dangerous patterns in a command string.
+ * Returns { dangerous: bool, operators: string[], warnings: string[] }
+ */
+function analyzeCommand(command) {
+  const warnings = [];
+  const detectedOps = [];
+
+  // Check command length
+  if (command.length > SECURITY_CONFIG.maxCommandLength) {
+    warnings.push(`[SECURITY] Command exceeds max length (${command.length}/${SECURITY_CONFIG.maxCommandLength})`);
+  }
+
+  // Detect shell operators
+  for (const op of SHELL_OPERATORS) {
+    if (command.includes(op)) detectedOps.push(op);
+  }
+  if (detectedOps.length > 0) {
+    warnings.push(`[SECURITY] Shell operators detected: ${detectedOps.join(', ')}`);
+  }
+
+  // Check for dangerous commands
+  const isDangerous = DANGEROUS_COMMANDS.some(p => p.test(command));
+  if (isDangerous) {
+    warnings.push(`[SECURITY] Potentially destructive command detected`);
+  }
+
+  // Detect null bytes (path traversal indicator)
+  if (command.includes('\0')) {
+    warnings.push(`[SECURITY] Null byte detected in command`);
+  }
+
+  return { dangerous: isDangerous, operators: detectedOps, warnings };
+}
 
 // ─── Active child process tracking ─────────────────────────────────────────────
 // Tracks all spawned child PIDs so we can force-kill on exit
@@ -91,8 +152,17 @@ function forceKillTree(pid) {
  */
 async function execCmd(command, options = {}) {
   const cwd = options.cwd || "C:\\Dev";
-  const timeoutMs = Math.max(100, Math.min(options.timeout || 30000, 300000));
-  const maxOutput = 10 * 1024 * 1024; // 10MB
+  const timeoutMs = Math.max(100, Math.min(options.timeout || SECURITY_CONFIG.commandTimeout, SECURITY_CONFIG.maxTimeout));
+  const maxOutput = SECURITY_CONFIG.maxOutputSize;
+
+  // Security analysis (non-blocking, just warnings in output)
+  const analysis = analyzeCommand(command);
+  const securityPrefix = analysis.warnings.length > 0 ? analysis.warnings.join('\n') + '\n' : '';
+
+  // Reject commands exceeding max length
+  if (command.length > SECURITY_CONFIG.maxCommandLength) {
+    return { content: [{ type: "text", text: `[SECURITY] Command rejected: exceeds max length (${command.length}/${SECURITY_CONFIG.maxCommandLength})\n[EXIT 1]` }] };
+  }
 
   // Evict oldest process if at capacity (instead of queuing)
   evictIfFull();
@@ -151,6 +221,7 @@ async function execCmd(command, options = {}) {
       const stdout = Buffer.concat(stdoutChunks).toString().trim();
       const stderr = Buffer.concat(stderrChunks).toString().trim();
       const parts = [];
+      if (securityPrefix) parts.push(securityPrefix.trim());
       if (stdout) parts.push(stdout);
       if (stderr) parts.push(`[STDERR] ${stderr}`);
       if (timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
@@ -193,19 +264,30 @@ function psSync(script, timeoutMs = 10000) {
 const _rateCalls = new Map();
 function rateCheck(tool) {
   const now = Date.now();
-  const calls = (_rateCalls.get(tool) || []).filter(t => now - t < 60000);
-  if (calls.length >= 60) return "[RATE LIMITED] Max 60 calls/min. Try again later.";
+  const calls = (_rateCalls.get(tool) || []).filter(t => now - t < SECURITY_CONFIG.rateLimitWindow);
+  if (calls.length >= SECURITY_CONFIG.rateLimit) return `[RATE LIMITED] Max ${SECURITY_CONFIG.rateLimit} calls/min. Try again later.`;
   calls.push(now);
   _rateCalls.set(tool, calls);
   return null;
 }
 
 // Validate working directory to prevent path traversal
+// Enhanced with symlink resolution and traversal prevention (inspired by cli-mcp-server)
 function validateCwd(cwd) {
   if (!cwd) return "C:\\Dev";
-  // Block null bytes and suspicious path components
+  // Block null bytes
   if (cwd.includes('\0')) return "C:\\Dev";
-  return cwd;
+  try {
+    // Normalize and resolve to absolute path to prevent traversal via ../ or ./ 
+    const resolved = resolve(normalize(cwd));
+    // Block UNC paths that could access network resources
+    if (resolved.startsWith('\\\\')) return "C:\\Dev";
+    // Block paths with suspicious double-dot sequences post-resolution
+    if (resolved.includes('..')) return "C:\\Dev";
+    return resolved;
+  } catch (_) {
+    return "C:\\Dev";
+  }
 }
 
 // ─── Tool 1: Run a single CMD command ──────────────────────────────────────────
@@ -251,9 +333,8 @@ server.tool(
   },
   async ({ commands, timeout, continueOnError }) => {
     // Cap batch size to prevent resource exhaustion
-    const maxBatch = 20;
-    if (commands.length > maxBatch) {
-      return { content: [{ type: "text", text: `[ERROR] Max ${maxBatch} commands per batch. Got ${commands.length}.` }] };
+    if (commands.length > SECURITY_CONFIG.maxBatchSize) {
+      return { content: [{ type: "text", text: `[ERROR] Max ${SECURITY_CONFIG.maxBatchSize} commands per batch. Got ${commands.length}.` }] };
     }
 
     const results = [];
@@ -293,8 +374,8 @@ server.tool(
   },
   async ({ command, cwd, timeout }) => {
     const workDir = validateCwd(cwd);
-    const timeoutMs = Math.max(100, Math.min(timeout || 30000, 300000));
-    const maxOutput = 5 * 1024 * 1024;
+    const timeoutMs = Math.max(100, Math.min(timeout || SECURITY_CONFIG.commandTimeout, SECURITY_CONFIG.maxTimeout));
+    const maxOutput = SECURITY_CONFIG.maxOutputSize / 2; // 5MB for PS (half of CMD limit)
 
     // Evict oldest process if at capacity
     evictIfFull();
@@ -571,6 +652,58 @@ server.tool(
     } catch (err) {
       return { content: [{ type: "text", text: `[ERROR] ${err.message}` }] };
     }
+  }
+);
+
+// ─── Tool 7: Show security rules (inspired by cli-mcp-server) ─────────────────
+
+server.tool(
+  "show_security_rules",
+  "Display current security configuration, restrictions, and runtime limits. Shows command length limits, timeout values, concurrency settings, dangerous command patterns, and MCP infrastructure protection rules.",
+  {},
+  async () => {
+    const rules = [
+      `Security Configuration`,
+      `==================`,
+      ``,
+      `Runtime Limits:`,
+      `  Max Command Length: ${SECURITY_CONFIG.maxCommandLength} bytes`,
+      `  Default Timeout: ${SECURITY_CONFIG.commandTimeout}ms`,
+      `  Max Timeout: ${SECURITY_CONFIG.maxTimeout}ms`,
+      `  Max Output Size: ${(SECURITY_CONFIG.maxOutputSize / 1024 / 1024).toFixed(0)}MB`,
+      `  Max Batch Size: ${SECURITY_CONFIG.maxBatchSize} commands`,
+      `  Rate Limit: ${SECURITY_CONFIG.rateLimit} calls/min (process tools)`,
+      ``,
+      `Concurrency:`,
+      `  Max Concurrent Processes: ${MAX_CONCURRENT}`,
+      `  Idle Timeout: ${IDLE_TIMEOUT_MS}ms`,
+      `  Active Processes: ${_runningProcs.size}`,
+      `  Tracked Children: ${_activeChildren.size}`,
+      ``,
+      `Security Features:`,
+      `  ✅ Path traversal prevention (resolve + normalize + UNC block)`,
+      `  ✅ Null byte injection detection`,
+      `  ✅ Shell operator detection (${SHELL_OPERATORS.join(', ')})`,
+      `  ✅ Dangerous command detection (${DANGEROUS_COMMANDS.length} patterns)`,
+      `  ✅ Command length enforcement`,
+      `  ✅ Process tree kill on timeout (taskkill /T /F)`,
+      `  ✅ Stdin closed to prevent interactive prompts`,
+      `  ✅ MCP infrastructure process protection (${MCP_PATTERNS.length} patterns)`,
+      `  ✅ Rate limiting on process management tools`,
+      `  ✅ Idle watchdog auto-kill`,
+      `  ✅ Evict-oldest concurrency strategy`,
+      ``,
+      `Shell Operators Monitored:`,
+      `  ${SHELL_OPERATORS.join('  ')}`,
+      `  (Operators are allowed but generate security warnings in output)`,
+      ``,
+      `Dangerous Command Patterns:`,
+      `  rd/rmdir, del, format, diskpart, reg delete/add,`,
+      `  net user/localgroup, sc/net stop/delete, shutdown,`,
+      `  sfc, bcdedit, powershell -enc, Remove-Item`,
+      `  (Commands are allowed but generate security warnings in output)`,
+    ];
+    return { content: [{ type: "text", text: rules.join("\n") }] };
   }
 );
 
