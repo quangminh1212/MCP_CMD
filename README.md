@@ -1,6 +1,6 @@
 # MCP CMD — Chạy lệnh Windows không bao giờ bị treo 🚀
 
-> MCP Server nhẹ, giúp AI assistant (Antigravity, Claude, Gemini CLI...) chạy lệnh CMD & PowerShell trên Windows **an toàn, không bao giờ bị treo**.
+> MCP Server nhẹ, giúp AI assistant (Antigravity, Claude, Gemini CLI...) chạy lệnh CMD & PowerShell trên Windows **an toàn, không bao giờ bị treo**, với **bảo mật đa tầng**.
 
 **🔗 Repo:** [github.com/quangminh1212/MCP_CMD](https://github.com/quangminh1212/MCP_CMD)
 
@@ -17,11 +17,13 @@ Khi dùng AI coding assistant trên Windows, lệnh shell thường **bị treo 
 - ✅ Đóng `stdin` ngay lập tức — không prompt nào block được
 - ✅ Tự kill cả process tree khi timeout — không zombie
 - ✅ PowerShell chạy qua Base64 — hết lỗi escape
-- ✅ Output giới hạn 5MB — không tràn bộ nhớ
+- ✅ Output giới hạn 10MB — không tràn bộ nhớ
+- ✅ Phát hiện shell injection & lệnh nguy hiểm — cảnh báo bảo mật
+- ✅ Chống path traversal & UNC injection — bảo vệ thư mục làm việc
 
 ---
 
-## 6 Tools có sẵn
+## 7 Tools có sẵn
 
 | Tool | Mô tả |
 |------|--------|
@@ -31,6 +33,7 @@ Khi dùng AI coding assistant trên Windows, lệnh shell thường **bị treo 
 | `system_info` | Xem thông tin hệ thống (OS, RAM, user) |
 | `process_list` | Liệt kê các process đang chạy |
 | `process_cleanup` | Dọn dẹp process treo/zombie |
+| `show_security_rules` | Hiển thị cấu hình bảo mật & giới hạn runtime |
 
 ---
 
@@ -54,7 +57,7 @@ Thêm đoạn sau vào file cấu hình MCP của bạn (ví dụ: `.gemini/sett
     "cmd": {
       "command": "node",
       "args": ["C:\\path\\to\\MCP_CMD\\index.js"],
-      "autoApprove": ["cmd_run", "cmd_batch", "powershell_run", "system_info", "process_list", "process_cleanup"]
+      "autoApprove": ["cmd_run", "cmd_batch", "powershell_run", "system_info", "process_list", "process_cleanup", "show_security_rules"]
     }
   }
 }
@@ -150,9 +153,13 @@ AI assistant của bạn giờ có thể chạy lệnh Windows mà **không bao 
 |---------|---------------|
 | Không treo khi chờ input | `stdin.end()` ngay sau spawn |
 | Không process zombie | `taskkill /T /F /PID` kill cả cây process |
-| Không tràn bộ nhớ | Output giới hạn 5MB |
+| Không tràn bộ nhớ | Output giới hạn 10MB |
 | Không popup GUI | `windowsHide: true` |
 | Không lỗi escape PS | PowerShell dùng `-EncodedCommand` (Base64 UTF-16LE) |
+| Chống path traversal | `resolve(normalize(cwd))` + chặn `..`, UNC, null byte |
+| Phát hiện lệnh nguy hiểm | Cảnh báo `[SECURITY]` cho `del`, `format`, `shutdown`... |
+| Phát hiện shell injection | Cảnh báo khi dùng `&&`, `\|`, `>`, `;`... |
+| Giới hạn độ dài lệnh | Chặn lệnh > 8192 bytes |
 
 ---
 
