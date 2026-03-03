@@ -13,8 +13,8 @@ const server = new McpServer({
 // Inspired by MladenSU/cli-mcp-server security features
 const SECURITY_CONFIG = {
   maxCommandLength: 8192,         // Max command string length (bytes)
-  commandTimeout: 30000,          // Default timeout (ms)
-  maxTimeout: 300000,             // Max allowed timeout (ms)
+  commandTimeout: 10000,          // Default timeout (ms) - hard cap at 10s
+  maxTimeout: 10000,              // Max allowed timeout (ms) - hard cap at 10s
   maxOutputSize: 10 * 1024 * 1024, // 10MB output cap
   maxBatchSize: 20,               // Max commands per batch
   rateLimit: 60,                  // Max calls/min for process management tools
@@ -301,7 +301,7 @@ server.tool(
     timeout: z
       .number()
       .optional()
-      .describe("Timeout in ms. Defaults to 30000 (30s). Max 300000 (5min)."),
+      .describe("Timeout in ms. Defaults to 10000. Max 10000."),
   },
   async ({ command, cwd, timeout }) => {
     return execCmd(command, { cwd: validateCwd(cwd), timeout });
@@ -325,7 +325,7 @@ server.tool(
     timeout: z
       .number()
       .optional()
-      .describe("Timeout per command in ms. Defaults to 30000."),
+      .describe("Timeout per command in ms. Defaults to 10000."),
     continueOnError: z
       .boolean()
       .optional()
@@ -370,7 +370,7 @@ server.tool(
     timeout: z
       .number()
       .optional()
-      .describe("Timeout in ms. Defaults to 30000. Max 300000."),
+      .describe("Timeout in ms. Defaults to 10000. Max 10000."),
   },
   async ({ command, cwd, timeout }) => {
     const workDir = validateCwd(cwd);
