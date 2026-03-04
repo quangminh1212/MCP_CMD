@@ -73,6 +73,18 @@ function analyzeCommand(command) {
 // Tracks all spawned child PIDs so we can force-kill on exit
 const _activeChildren = new Set();
 
+/**
+ * Safely destroy all stdio streams of a child process.
+ * This is critical to unblock the "close" event which waits for ALL streams to close.
+ * On Windows, grandchild processes can inherit pipes, keeping them open indefinitely.
+ */
+function destroyStreams(child) {
+  if (!child) return;
+  try { child.stdin && !child.stdin.destroyed && child.stdin.destroy(); } catch (_) { }
+  try { child.stdout && !child.stdout.destroyed && child.stdout.destroy(); } catch (_) { }
+  try { child.stderr && !child.stderr.destroyed && child.stderr.destroy(); } catch (_) { }
+}
+
 // ─── Concurrency limiter (evict-oldest strategy) ────────────────────────────────
 // Max 3 simultaneous child processes. When full, kills the OLDEST to make room.
 const MAX_CONCURRENT = 3;
@@ -82,9 +94,9 @@ const IDLE_TIMEOUT_MS = 10000; // 10s no-output → auto-kill
 // Each entry: { pid, startedAt, lastOutputAt, kill: () => void }
 const _runningProcs = new Map();
 
-function registerProc(pid, killFn) {
+function registerProc(pid, killFn, childRef) {
   const now = Date.now();
-  _runningProcs.set(pid, { pid, startedAt: now, lastOutputAt: now, kill: killFn });
+  _runningProcs.set(pid, { pid, startedAt: now, lastOutputAt: now, kill: killFn, child: childRef });
 }
 
 function touchProc(pid) {
@@ -120,6 +132,8 @@ const _idleWatchdog = setInterval(() => {
   for (const [pid, entry] of _runningProcs) {
     if (now - entry.lastOutputAt > IDLE_TIMEOUT_MS) {
       try { entry.kill(); } catch (_) { /* best effort */ }
+      // Destroy streams to unblock "close" event after kill
+      if (entry.child) destroyStreams(entry.child);
       _runningProcs.delete(pid);
     }
   }
@@ -208,6 +222,10 @@ async function execCmd(command, options = {}) {
       if (!finished) {
         timedOut = true;
         forceKillTree(child.pid);
+        // Destroy streams to unblock "close" event (grandchild may hold pipes)
+        destroyStreams(child);
+        // Emergency force-resolve: if "close" still doesn't fire after 3s
+        setTimeout(() => { done(null); }, 3000);
       }
     }, timeoutMs);
 
@@ -217,6 +235,8 @@ async function execCmd(command, options = {}) {
       clearTimeout(timer);
       _activeChildren.delete(child.pid);
       unregisterProc(child.pid);
+      // Ensure streams are destroyed to prevent resource leaks
+      destroyStreams(child);
 
       const stdout = Buffer.concat(stdoutChunks).toString().trim();
       const stderr = Buffer.concat(stderrChunks).toString().trim();
@@ -235,9 +255,19 @@ async function execCmd(command, options = {}) {
       });
     }
 
-    // Register for eviction + idle tracking
-    if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid));
+    // Register for eviction + idle tracking (pass child ref for stream cleanup)
+    if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid), child);
 
+    // "exit" fires when process terminates, even if streams are still open.
+    // Use as backup: if "close" doesn't fire within 2s after "exit", force-done.
+    child.on("exit", (code) => {
+      setTimeout(() => {
+        if (!finished) {
+          destroyStreams(child);
+          done(code);
+        }
+      }, 2000);
+    });
     child.on("close", (code) => done(code));
     child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
   });
@@ -429,6 +459,10 @@ server.tool(
         if (!finished) {
           timedOut = true;
           forceKillTree(child.pid);
+          // Destroy streams to unblock "close" event
+          destroyStreams(child);
+          // Emergency force-resolve after 3s
+          setTimeout(() => { done(null); }, 3000);
         }
       }, timeoutMs);
 
@@ -438,6 +472,7 @@ server.tool(
         clearTimeout(timer);
         _activeChildren.delete(child.pid);
         unregisterProc(child.pid);
+        destroyStreams(child);
 
         const stdout = Buffer.concat(stdoutChunks).toString().trim();
         const stderr = Buffer.concat(stderrChunks).toString().trim();
@@ -449,8 +484,17 @@ server.tool(
         resolve({ content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }] });
       }
 
-      if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid));
+      if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid), child);
 
+      // "exit" event backup: force-done if "close" doesn't fire within 2s
+      child.on("exit", (code) => {
+        setTimeout(() => {
+          if (!finished) {
+            destroyStreams(child);
+            done(code);
+          }
+        }, 2000);
+      });
       child.on("close", (code) => done(code));
       child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
     });
