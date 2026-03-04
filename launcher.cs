@@ -21,7 +21,7 @@ using System.Runtime.InteropServices;
 ///   - Only spawns cmd.exe with CreateNoWindow = true
 /// 
 /// Usage in mcp_config.json:
-///   { "command": "C:\\Dev\\MCP_CMD\\headless-launcher.exe",
+///   { "command": "C:\\Dev\\MCP_CMD\\launcher.exe",
 ///     "args": ["npx", "-y", "@upstash/context7-mcp@latest"] }
 /// </summary>
 class HeadlessLauncher

@@ -7,7 +7,7 @@
  * 
  * Usage in mcp_config.json:
  *   Instead of: { "command": "npx", "args": ["-y", "some-mcp-server"] }
- *   Use:        { "command": "node", "args": ["C:\\Dev\\MCP_CMD\\headless-wrapper.js", "npx", "-y", "some-mcp-server"] }
+ *   Use:        { "command": "node", "args": ["C:\\Dev\\MCP_CMD\\wrapper.js", "npx", "-y", "some-mcp-server"] }
  * 
  * This wrapper:
  * 1. Resolves .cmd/.ps1 wrappers (npx, npm, etc.) to actual executables
@@ -24,8 +24,8 @@ import { existsSync } from "fs";
 const [command, ...args] = process.argv.slice(2);
 
 if (!command) {
-    process.stderr.write("[headless-wrapper] Error: No command specified.\n");
-    process.stderr.write("Usage: node headless-wrapper.js <command> [args...]\n");
+    process.stderr.write("[wrapper] Error: No command specified.\n");
+    process.stderr.write("Usage: node wrapper.js <command> [args...]\n");
     process.exit(1);
 }
 
@@ -103,7 +103,7 @@ child.on("close", (code) => {
 });
 
 child.on("error", (err) => {
-    process.stderr.write(`[headless-wrapper] Failed to start '${command}': ${err.message}\n`);
+    process.stderr.write(`[wrapper] Failed to start '${command}': ${err.message}\n`);
     process.exit(1);
 });
 

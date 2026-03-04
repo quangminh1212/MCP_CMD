@@ -574,7 +574,7 @@ const MCP_PATTERNS = [
   /npm\s+run\s+dev/i, /npm-cli\.js.*\s+run\s+dev/i, // npm dev servers
   /run-driver/i, // playwright-go driver
   /MCP_CMD[\\\/]index\.js/i, // self-protection: don't kill MCP_CMD server
-  /headless-launcher/i, /headless-wrapper/i, // MCP_CMD helpers
+  /launcher\.(cs|exe)/i, /wrapper\.js/i, // MCP_CMD helpers
   /mcp_server_\w+/i, // Python-based MCP servers (time, fetch, duckduckgo, git, etc.)
   /uv\s+.*run\s+/i, // uv-launched Python MCP servers
   /mem0/i, // mem0 memory MCP server
