@@ -1,6 +1,2 @@
 node_modules/
 *.log
-test_stderr.log
-headless-launcher.exe
-headless-launcher-old.exe
-headless-launcher-new.exe
