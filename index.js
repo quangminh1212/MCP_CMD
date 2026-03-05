@@ -19,17 +19,25 @@ const SECURITY_CONFIG = {
   maxBatchSize: 20,               // Max commands per batch
   rateLimit: 60,                  // Max calls/min for process management tools
   rateLimitWindow: 60000,         // Rate limit window (ms)
+  allowedBaseDir: "C:\\Dev",      // Base directory for file-destructive operations
 };
 
-// Dangerous commands that warrant a warning prefix in output
-const DANGEROUS_COMMANDS = [
-  /^(rd|rmdir)\s/i, /^del\s/i, /^format\s/i,
-  /^diskpart/i, /^reg\s+(delete|add)/i,
+// System-level commands: ALWAYS blocked (cannot be scoped to a directory)
+const ALWAYS_BLOCKED_COMMANDS = [
+  /^format\s/i, /^diskpart/i, /^reg\s+(delete|add)/i,
   /^net\s+(user|localgroup)\s/i,
   /^(sc|net)\s+(stop|delete|config)\s/i,
   /^shutdown\s/i, /^sfc\s/i, /^bcdedit/i,
-  /^powershell.*-enc/i, /Remove-Item/i,
+  /^powershell.*-enc/i,
 ];
+
+// File-destructive commands: allowed ONLY within cwd that is a project under allowedBaseDir
+const FILE_DESTRUCTIVE_COMMANDS = [
+  /^(rd|rmdir)\s/i, /^del\s/i, /Remove-Item/i,
+];
+
+// Combined list for general detection
+const DANGEROUS_COMMANDS = [...ALWAYS_BLOCKED_COMMANDS, ...FILE_DESTRUCTIVE_COMMANDS];
 
 // Shell operators that could indicate injection attempts
 const SHELL_OPERATORS = ['&&', '||', '|', '>', '>>', '<', '<<', ';', '`'];
@@ -55,10 +63,14 @@ function analyzeCommand(command) {
     warnings.push(`[SECURITY] Shell operators detected: ${detectedOps.join(', ')}`);
   }
 
-  // Check for dangerous commands
-  const isDangerous = DANGEROUS_COMMANDS.some(p => p.test(command));
-  if (isDangerous) {
-    warnings.push(`[SECURITY] Potentially destructive command detected`);
+  // Check for dangerous commands (split into categories)
+  const isAlwaysBlocked = ALWAYS_BLOCKED_COMMANDS.some(p => p.test(command));
+  const isFileDestructive = FILE_DESTRUCTIVE_COMMANDS.some(p => p.test(command));
+  const isDangerous = isAlwaysBlocked || isFileDestructive;
+  if (isAlwaysBlocked) {
+    warnings.push(`[SECURITY] System-level destructive command BLOCKED`);
+  } else if (isFileDestructive) {
+    warnings.push(`[SECURITY] File-destructive command detected (cwd-restricted)`);
   }
 
   // Detect null bytes (path traversal indicator)
@@ -66,7 +78,7 @@ function analyzeCommand(command) {
     warnings.push(`[SECURITY] Null byte detected in command`);
   }
 
-  return { dangerous: isDangerous, operators: detectedOps, warnings };
+  return { dangerous: isDangerous, alwaysBlocked: isAlwaysBlocked, fileDestructive: isFileDestructive, operators: detectedOps, warnings };
 }
 
 // ─── Active child process tracking ─────────────────────────────────────────────
@@ -169,9 +181,19 @@ async function execCmd(command, options = {}) {
   const timeoutMs = Math.max(100, Math.min(options.timeout || SECURITY_CONFIG.commandTimeout, SECURITY_CONFIG.maxTimeout));
   const maxOutput = SECURITY_CONFIG.maxOutputSize;
 
-  // Security analysis (non-blocking, just warnings in output)
+  // Security analysis
   const analysis = analyzeCommand(command);
   const securityPrefix = analysis.warnings.length > 0 ? analysis.warnings.join('\n') + '\n' : '';
+
+  // BLOCK system-level dangerous commands (format, diskpart, shutdown, etc.)
+  if (analysis.alwaysBlocked) {
+    return { content: [{ type: "text", text: `${securityPrefix}[BLOCKED] System-level destructive command rejected.\n[EXIT 1]` }] };
+  }
+
+  // File-destructive commands: only allowed within cwd under allowedBaseDir
+  if (analysis.fileDestructive && !isFileOpSafe(command, cwd)) {
+    return { content: [{ type: "text", text: `${securityPrefix}[BLOCKED] File operation targets outside allowed directory (${cwd}).\nFile deletion is only allowed within project directories under ${SECURITY_CONFIG.allowedBaseDir}.\n[EXIT 1]` }] };
+  }
 
   // Reject commands exceeding max length
   if (command.length > SECURITY_CONFIG.maxCommandLength) {
@@ -318,6 +340,49 @@ function validateCwd(cwd) {
   } catch (_) {
     return "C:\\Dev";
   }
+}
+
+/**
+ * Check if a file-destructive command is safe to run within the given cwd.
+ * Rules:
+ *   1. cwd must be at least one level under allowedBaseDir (e.g. C:\Dev\MyProject, NOT C:\Dev itself)
+ *   2. All target paths in the command must resolve within cwd (no escaping via .. or absolute paths)
+ */
+function isFileOpSafe(command, cwd) {
+  const baseDir = resolve(SECURITY_CONFIG.allowedBaseDir).toLowerCase();
+  const resolvedCwd = resolve(normalize(cwd)).toLowerCase();
+
+  // cwd must be under allowedBaseDir
+  if (!resolvedCwd.startsWith(baseDir + "\\") && resolvedCwd !== baseDir) return false;
+
+  // cwd must be at least one level deeper than baseDir (prevent bulk delete at C:\Dev)
+  if (resolvedCwd === baseDir) return false;
+
+  // Extract arguments after the command keyword (del, rd, rmdir, Remove-Item)
+  const match = command.match(/^(?:del|rd|rmdir|Remove-Item)\s+(.*)$/i);
+  if (!match) return true; // No args = no target
+
+  const argsStr = match[1];
+  // Tokenize: split by spaces but respect quotes
+  const tokens = argsStr.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+
+  for (const token of tokens) {
+    // Skip CMD switches (/s, /q, /f) and PS switches (-Recurse, -Force)
+    if (/^\/[a-zA-Z]/.test(token) || token.startsWith('-')) continue;
+    // Skip wildcards without path component
+    const cleaned = token.replace(/"/g, '');
+    if (!cleaned || cleaned === '*' || cleaned === '.' || cleaned === '*.*') continue;
+
+    // Resolve the path relative to cwd
+    const resolvedTarget = resolve(resolvedCwd, cleaned).toLowerCase();
+
+    // Target must stay within cwd (not escape to parent dirs)
+    if (!resolvedTarget.startsWith(resolvedCwd + "\\") && resolvedTarget !== resolvedCwd) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 // ─── Tool 1: Run a single CMD command ──────────────────────────────────────────
@@ -741,11 +806,15 @@ server.tool(
       `  ${SHELL_OPERATORS.join('  ')}`,
       `  (Operators are allowed but generate security warnings in output)`,
       ``,
-      `Dangerous Command Patterns:`,
-      `  rd/rmdir, del, format, diskpart, reg delete/add,`,
-      `  net user/localgroup, sc/net stop/delete, shutdown,`,
-      `  sfc, bcdedit, powershell -enc, Remove-Item`,
-      `  (Commands are allowed but generate security warnings in output)`,
+      `Dangerous Command Enforcement:`,
+      `  ALWAYS BLOCKED (system-level):`,
+      `    format, diskpart, reg delete/add, net user/localgroup,`,
+      `    sc/net stop/delete, shutdown, sfc, bcdedit, powershell -enc`,
+      `  CWD-RESTRICTED (file operations - only within project under ${SECURITY_CONFIG.allowedBaseDir}):`,
+      `    rd/rmdir, del, Remove-Item`,
+      `  ✅ System commands are hard-blocked (cannot be bypassed)`,
+      `  ✅ File operations require cwd to be a project under allowedBaseDir`,
+      `  ✅ File operation targets must resolve within cwd (no path escape)`,
     ];
     return { content: [{ type: "text", text: rules.join("\n") }] };
   }
