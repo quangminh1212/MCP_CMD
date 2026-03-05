@@ -2,7 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { spawn, spawnSync } from "child_process";
-import { resolve, normalize } from "path";
+import { resolve, normalize, join } from "path";
+import { existsSync } from "fs";
 
 const server = new McpServer({
   name: "mcp-cmd",
@@ -19,7 +20,7 @@ const SECURITY_CONFIG = {
   maxBatchSize: 20,               // Max commands per batch
   rateLimit: 60,                  // Max calls/min for process management tools
   rateLimitWindow: 60000,         // Rate limit window (ms)
-  allowedBaseDir: "C:\\Dev",      // Base directory for file-destructive operations
+  // File-destructive ops are scoped to the detected project root (via .git, package.json, etc.)
 };
 
 // System-level commands: ALWAYS blocked (cannot be scoped to a directory)
@@ -192,7 +193,7 @@ async function execCmd(command, options = {}) {
 
   // File-destructive commands: only allowed within cwd under allowedBaseDir
   if (analysis.fileDestructive && !isFileOpSafe(command, cwd)) {
-    return { content: [{ type: "text", text: `${securityPrefix}[BLOCKED] File operation targets outside allowed directory (${cwd}).\nFile deletion is only allowed within project directories under ${SECURITY_CONFIG.allowedBaseDir}.\n[EXIT 1]` }] };
+    return { content: [{ type: "text", text: `${securityPrefix}[BLOCKED] File operation targets outside project boundary (${cwd}).\nFile deletion is only allowed within a recognized project directory (detected via .git, package.json, etc.).\n[EXIT 1]` }] };
   }
 
   // Reject commands exceeding max length
@@ -342,21 +343,52 @@ function validateCwd(cwd) {
   }
 }
 
+// Project root markers: if any of these exist in a directory, it's a project root
+const PROJECT_MARKERS = [
+  '.git', 'package.json', 'Cargo.toml', 'go.mod', 'pyproject.toml',
+  'setup.py', 'pom.xml', 'build.gradle', '.sln', '.csproj',
+  'Makefile', 'CMakeLists.txt', 'composer.json', 'Gemfile',
+];
+
+/**
+ * Walk up from `startDir` to find the nearest project root.
+ * Returns the project root path, or null if no project marker is found.
+ * Stops at the filesystem root to prevent infinite loop.
+ */
+function findProjectRoot(startDir) {
+  let dir = resolve(normalize(startDir));
+  const root = resolve(dir.split('\\')[0] + '\\'); // e.g. "C:\\"
+  while (true) {
+    for (const marker of PROJECT_MARKERS) {
+      try {
+        if (existsSync(join(dir, marker))) return dir;
+      } catch (_) { /* permission denied etc. */ }
+    }
+    const parent = resolve(dir, '..');
+    if (parent === dir || dir === root) break; // reached filesystem root
+    dir = parent;
+  }
+  return null;
+}
+
 /**
  * Check if a file-destructive command is safe to run within the given cwd.
  * Rules:
- *   1. cwd must be at least one level under allowedBaseDir (e.g. C:\Dev\MyProject, NOT C:\Dev itself)
- *   2. All target paths in the command must resolve within cwd (no escaping via .. or absolute paths)
+ *   1. cwd must be inside a recognized project (detected via project markers)
+ *   2. All target paths in the command must resolve within the project root
  */
 function isFileOpSafe(command, cwd) {
-  const baseDir = resolve(SECURITY_CONFIG.allowedBaseDir).toLowerCase();
-  const resolvedCwd = resolve(normalize(cwd)).toLowerCase();
+  const resolvedCwd = resolve(normalize(cwd));
 
-  // cwd must be under allowedBaseDir
-  if (!resolvedCwd.startsWith(baseDir + "\\") && resolvedCwd !== baseDir) return false;
+  // Find the project root from cwd
+  const projectRoot = findProjectRoot(resolvedCwd);
+  if (!projectRoot) return false; // Not inside any recognized project → block
 
-  // cwd must be at least one level deeper than baseDir (prevent bulk delete at C:\Dev)
-  if (resolvedCwd === baseDir) return false;
+  const projectRootLower = projectRoot.toLowerCase();
+  const resolvedCwdLower = resolvedCwd.toLowerCase();
+
+  // cwd must be within the project root
+  if (!resolvedCwdLower.startsWith(projectRootLower + '\\') && resolvedCwdLower !== projectRootLower) return false;
 
   // Extract arguments after the command keyword (del, rd, rmdir, Remove-Item)
   const match = command.match(/^(?:del|rd|rmdir|Remove-Item)\s+(.*)$/i);
@@ -374,10 +406,10 @@ function isFileOpSafe(command, cwd) {
     if (!cleaned || cleaned === '*' || cleaned === '.' || cleaned === '*.*') continue;
 
     // Resolve the path relative to cwd
-    const resolvedTarget = resolve(resolvedCwd, cleaned).toLowerCase();
+    const resolvedTarget = resolve(resolvedCwdLower, cleaned).toLowerCase();
 
-    // Target must stay within cwd (not escape to parent dirs)
-    if (!resolvedTarget.startsWith(resolvedCwd + "\\") && resolvedTarget !== resolvedCwd) {
+    // Target must stay within the project root (not escape to parent dirs)
+    if (!resolvedTarget.startsWith(projectRootLower + '\\') && resolvedTarget !== projectRootLower) {
       return false;
     }
   }
@@ -810,11 +842,12 @@ server.tool(
       `  ALWAYS BLOCKED (system-level):`,
       `    format, diskpart, reg delete/add, net user/localgroup,`,
       `    sc/net stop/delete, shutdown, sfc, bcdedit, powershell -enc`,
-      `  CWD-RESTRICTED (file operations - only within project under ${SECURITY_CONFIG.allowedBaseDir}):`,
+      `  PROJECT-SCOPED (file operations - only within detected project root):`,
       `    rd/rmdir, del, Remove-Item`,
+      `  Project markers: ${PROJECT_MARKERS.join(', ')}`,
       `  ✅ System commands are hard-blocked (cannot be bypassed)`,
-      `  ✅ File operations require cwd to be a project under allowedBaseDir`,
-      `  ✅ File operation targets must resolve within cwd (no path escape)`,
+      `  ✅ File ops require cwd inside a recognized project (auto-detected)`,
+      `  ✅ File operation targets must resolve within project root (no escape)`,
     ];
     return { content: [{ type: "text", text: rules.join("\n") }] };
   }
