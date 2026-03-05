@@ -14,8 +14,8 @@ const server = new McpServer({
 // Inspired by MladenSU/cli-mcp-server security features
 const SECURITY_CONFIG = {
   maxCommandLength: 8192,         // Max command string length (bytes)
-  commandTimeout: 10000,          // Default timeout (ms) - hard cap at 10s
-  maxTimeout: 10000,              // Max allowed timeout (ms) - hard cap at 10s
+  commandTimeout: 10000,          // Default timeout (ms)
+  maxTimeout: 30000,              // Max allowed timeout (ms) - 30s for chained commands
   maxOutputSize: 10 * 1024 * 1024, // 10MB output cap
   maxBatchSize: 20,               // Max commands per batch
   rateLimit: 60,                  // Max calls/min for process management tools
@@ -101,7 +101,7 @@ function destroyStreams(child) {
 // ─── Concurrency limiter (evict-oldest strategy) ────────────────────────────────
 // Max 3 simultaneous child processes. When full, kills the OLDEST to make room.
 const MAX_CONCURRENT = 3;
-const IDLE_TIMEOUT_MS = 10000; // 10s no-output → auto-kill
+const IDLE_TIMEOUT_MS = 20000; // 20s no-output → auto-kill (git ops can be slow)
 
 // Track running processes with metadata for eviction
 // Each entry: { pid, startedAt, lastOutputAt, kill: () => void }
@@ -218,6 +218,12 @@ async function execCmd(command, options = {}) {
         cwd,
         windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0",     // Prevent git from prompting for credentials
+          GIT_EDITOR: "true",            // Prevent git commit from opening editor
+          GIT_SSH_COMMAND: "ssh -o BatchMode=yes", // Prevent SSH passphrase prompt
+        },
       });
     } catch (spawnErr) {
       resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
@@ -441,7 +447,7 @@ server.tool(
     timeout: z
       .number()
       .optional()
-      .describe("Timeout in ms. Defaults to 10000. Max 10000."),
+      .describe("Timeout in ms. Defaults to 10000. Max 30000."),
   },
   async ({ command, cwd, timeout }) => {
     return execCmd(command, { cwd: validateCwd(cwd), timeout });
@@ -465,7 +471,7 @@ server.tool(
     timeout: z
       .number()
       .optional()
-      .describe("Timeout per command in ms. Defaults to 10000."),
+      .describe("Timeout per command in ms. Defaults to 10000. Max 30000."),
     continueOnError: z
       .boolean()
       .optional()
@@ -510,7 +516,7 @@ server.tool(
     timeout: z
       .number()
       .optional()
-      .describe("Timeout in ms. Defaults to 10000. Max 10000."),
+      .describe("Timeout in ms. Defaults to 10000. Max 30000."),
   },
   async ({ command, cwd, timeout }) => {
     const workDir = validateCwd(cwd);
@@ -541,7 +547,15 @@ server.tool(
         child = spawn(
           "powershell.exe",
           ["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-          { cwd: workDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] }
+          {
+            cwd: workDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+            env: {
+              ...process.env,
+              GIT_TERMINAL_PROMPT: "0",
+              GIT_EDITOR: "true",
+              GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+            },
+          }
         );
       } catch (spawnErr) {
         resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
