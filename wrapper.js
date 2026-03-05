@@ -96,6 +96,36 @@ process.stdin.pipe(child.stdin);
 child.stdout.pipe(process.stdout);
 child.stderr.pipe(process.stderr);
 
+// ─── Parent death detection via stdin EOF ──────────────────────────────────────
+// When parent process dies or closes its end of the pipe, stdin will emit 'end'.
+// Without this, wrapper+child become zombies on Windows if parent crashes.
+let _stdinEnded = false;
+process.stdin.on("end", () => {
+    _stdinEnded = true;
+    forceKillTree(child.pid);
+    process.exit(0);
+});
+process.stdin.on("close", () => {
+    if (!_stdinEnded) {
+        _stdinEnded = true;
+        forceKillTree(child.pid);
+        process.exit(0);
+    }
+});
+
+// Watchdog: periodically check if stdin is still usable (belt-and-suspenders)
+// On Windows, stdin 'end' event may not fire reliably when parent pipe breaks.
+// Poll every 5s as a safety net.
+const _watchdog = setInterval(() => {
+    // If stdin has ended/closed/destroyed, parent is gone
+    if (_stdinEnded || process.stdin.destroyed || !process.stdin.readable) {
+        clearInterval(_watchdog);
+        forceKillTree(child.pid);
+        process.exit(0);
+    }
+}, 5000);
+_watchdog.unref(); // Don't prevent natural process exit
+
 // Forward exit code + unpipe stdin to prevent backpressure
 child.on("close", (code) => {
     process.stdin.unpipe(child.stdin);
