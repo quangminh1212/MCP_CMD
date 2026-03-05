@@ -252,10 +252,23 @@ async function execCmd(command, options = {}) {
       }
     }, timeoutMs);
 
+    // Absolute deadline: if Promise hasn't resolved after timeoutMs + 10s,
+    // force-resolve to prevent MCP server from hanging indefinitely
+    const deadlineTimer = setTimeout(() => {
+      if (!finished) {
+        timedOut = true;
+        forceKillTree(child.pid);
+        destroyStreams(child);
+        done(null);
+      }
+    }, timeoutMs + 10000);
+    deadlineTimer.unref && deadlineTimer.unref();
+
     function done(exitCode) {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      clearTimeout(deadlineTimer);
       _activeChildren.delete(child.pid);
       unregisterProc(child.pid);
       // Ensure streams are destroyed to prevent resource leaks
@@ -563,10 +576,23 @@ server.tool(
         }
       }, timeoutMs);
 
+      // Absolute deadline: if Promise hasn't resolved after timeoutMs + 10s,
+      // force-resolve to prevent MCP server from hanging indefinitely
+      const deadlineTimer = setTimeout(() => {
+        if (!finished) {
+          timedOut = true;
+          forceKillTree(child.pid);
+          destroyStreams(child);
+          done(null);
+        }
+      }, timeoutMs + 10000);
+      deadlineTimer.unref && deadlineTimer.unref();
+
       function done(exitCode) {
         if (finished) return;
         finished = true;
         clearTimeout(timer);
+        clearTimeout(deadlineTimer);
         _activeChildren.delete(child.pid);
         unregisterProc(child.pid);
         destroyStreams(child);

@@ -143,9 +143,29 @@ class HeadlessLauncher
                             if (pp != null)
                             {
                                 pp.StandardInput.Close();
-                                string output = pp.StandardOutput.ReadToEnd().Trim();
-                                pp.WaitForExit(5000);
-                                int.TryParse(output, out ppid);
+                                // Read stdout in a background thread to avoid deadlock
+                                string psOutput = null;
+                                var readThread = new Thread(() => {
+                                    try { psOutput = pp.StandardOutput.ReadToEnd(); }
+                                    catch { }
+                                });
+                                readThread.IsBackground = true;
+                                readThread.Start();
+                                // Wait for process with 8s timeout
+                                if (pp.WaitForExit(8000))
+                                {
+                                    readThread.Join(2000);
+                                    if (psOutput != null)
+                                    {
+                                        int.TryParse(psOutput.Trim(), out ppid);
+                                    }
+                                }
+                                else
+                                {
+                                    // PowerShell hung - kill it
+                                    try { pp.Kill(); } catch { }
+                                    readThread.Join(1000);
+                                }
                             }
                         }
                     }
@@ -182,7 +202,7 @@ class HeadlessLauncher
                     }
                     finally
                     {
-                        parentProcess?.Dispose();
+                        if (parentProcess != null) parentProcess.Dispose();
                     }
                 }
                 catch { }
@@ -266,18 +286,33 @@ class HeadlessLauncher
             stderrThread.IsBackground = true;
             stderrThread.Start();
 
-            // Wait for child to exit
-            process.WaitForExit();
-            _exiting = true;
+            // Wait for child to exit with timeout
+            // Default max lifetime: 24 hours (86400s), configurable via HEADLESS_TIMEOUT_SEC
+            int waitMs = timeoutSec > 0 ? timeoutSec * 1000 : 86400 * 1000;
+            if (process.WaitForExit(waitMs))
+            {
+                _exiting = true;
 
-            // Give ALL pipe threads time to flush (including stdin)
-            stdinThread.Join(2000);
-            stdoutThread.Join(3000);
-            stderrThread.Join(3000);
+                // Give ALL pipe threads time to flush (including stdin)
+                stdinThread.Join(2000);
+                stdoutThread.Join(3000);
+                stderrThread.Join(3000);
 
-            int exitCode = process.ExitCode;
-            process.Dispose();
-            return exitCode;
+                int exitCode = process.ExitCode;
+                process.Dispose();
+                return exitCode;
+            }
+            else
+            {
+                // Child process hung beyond timeout - force kill
+                _exiting = true;
+                KillChildTree();
+                stdinThread.Join(1000);
+                stdoutThread.Join(1000);
+                stderrThread.Join(1000);
+                process.Dispose();
+                return 1;
+            }
         }
         catch
         {
@@ -315,7 +350,11 @@ class HeadlessLauncher
                     if (killer != null)
                     {
                         killer.StandardInput.Close();
-                        killer.WaitForExit(5000);
+                        if (!killer.WaitForExit(8000))
+                        {
+                            // taskkill itself hung - force kill it
+                            try { killer.Kill(); } catch { }
+                        }
                     }
                 }
             }
