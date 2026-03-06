@@ -143,13 +143,19 @@ function unregisterProc(pid) {
 function drainSpawnQueue() {
   while (_activeSlots < MAX_CONCURRENT && _spawnQueue.length > 0) {
     const next = _spawnQueue.shift();
-    if (next) next();
+    next?.grant();
   }
 }
 
-function acquireProcessSlot() {
+function acquireProcessSlot(timeoutMs) {
   return new Promise((resolve) => {
+    let finished = false;
+    let waitTimer;
+
     const grant = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(waitTimer);
       _activeSlots += 1;
       let released = false;
 
@@ -166,7 +172,17 @@ function acquireProcessSlot() {
       return;
     }
 
-    _spawnQueue.push(grant);
+    const entry = { grant };
+    _spawnQueue.push(entry);
+
+    waitTimer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      const index = _spawnQueue.indexOf(entry);
+      if (index >= 0) _spawnQueue.splice(index, 1);
+      resolve(null);
+    }, timeoutMs);
+    waitTimer.unref && waitTimer.unref();
   });
 }
 
@@ -219,7 +235,24 @@ async function runSpawnedProcess(options) {
     env = {},
   } = options;
 
-  const releaseSlot = await acquireProcessSlot();
+  const startedAt = Date.now();
+  const releaseSlot = await acquireProcessSlot(timeoutMs);
+  const queueWaitMs = Date.now() - startedAt;
+
+  if (!releaseSlot) {
+    return {
+      stdout: "",
+      stderr: "",
+      timedOut: true,
+      queueTimedOut: true,
+      queueWaitMs,
+      runtimeTimeoutMs: 0,
+      exitCode: 1,
+      spawnError: null,
+    };
+  }
+
+  const runtimeTimeoutMs = Math.max(100, timeoutMs - queueWaitMs);
 
   return new Promise((resolve) => {
     const stdoutChunks = [];
@@ -250,6 +283,9 @@ async function runSpawnedProcess(options) {
         stdout: Buffer.concat(stdoutChunks).toString().trim(),
         stderr: Buffer.concat(stderrChunks).toString().trim(),
         timedOut,
+        queueTimedOut: false,
+        queueWaitMs,
+        runtimeTimeoutMs,
         exitCode: exitCode ?? 1,
         spawnError,
       });
@@ -305,7 +341,7 @@ async function runSpawnedProcess(options) {
       destroyStreams(child);
       const closeTimer = setTimeout(() => done(null), PROCESS_CLOSE_GRACE_MS);
       closeTimer.unref && closeTimer.unref();
-    }, timeoutMs);
+    }, runtimeTimeoutMs);
 
     deadlineTimer = setTimeout(() => {
       if (finished) return;
@@ -313,7 +349,7 @@ async function runSpawnedProcess(options) {
       forceKillTree(child.pid);
       destroyStreams(child);
       done(null);
-    }, timeoutMs + PROCESS_DEADLINE_GRACE_MS);
+    }, runtimeTimeoutMs + PROCESS_DEADLINE_GRACE_MS);
     deadlineTimer.unref && deadlineTimer.unref();
 
     child.on("exit", (code) => {
@@ -342,7 +378,13 @@ function buildToolResultText(result, options = {}) {
   if (securityPrefix) parts.push(securityPrefix.trim());
   if (result.stdout) parts.push(result.stdout);
   if (result.stderr) parts.push(`[STDERR] ${result.stderr}`);
-  if (result.timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
+  if (result.queueTimedOut) {
+    parts.push(`[TIMEOUT] Queue wait exceeded ${timeoutMs}ms before process start`);
+  } else if (result.timedOut && result.queueWaitMs >= 100) {
+    parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms total (${result.runtimeTimeoutMs}ms runtime after ${result.queueWaitMs}ms queue wait)`);
+  } else if (result.timedOut) {
+    parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
+  }
   else if (result.exitCode !== 0 && !result.stdout && !result.stderr) {
     parts.push(`[ERROR] Process exited with code ${result.exitCode}`);
   }
@@ -875,6 +917,7 @@ server.tool(
       `  ✅ Rate limiting on process management tools`,
       `  ✅ Idle watchdog auto-kill`,
       `  ✅ FIFO concurrency queue`,
+      `  ✅ Per-request timeout includes queue wait`,
       ``,
       `Shell Operators Monitored:`,
       `  ${SHELL_OPERATORS.join('  ')}`,
