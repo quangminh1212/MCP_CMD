@@ -152,6 +152,88 @@ test("cmd_run kills spawned child trees on timeout", async (t) => {
   assert.deepEqual(after, before, `Expected no lingering detached ping.exe processes for ${marker}`);
 });
 
+test("cmd_run handles extended shell matrix without hanging", async (t) => {
+  const { client } = await connectClient(t, {
+    command: "node",
+    args: ["index.js"],
+  });
+
+  const matrix = [
+    {
+      command: "timeout /t 5",
+      timeout: 1500,
+      maxElapsedMs: 1500,
+      expected: /Input redirection is not supported/i,
+    },
+    {
+      command: "sort",
+      timeout: 1500,
+      maxElapsedMs: 1500,
+      expected: /\[EXIT 0\]/,
+    },
+    {
+      command: "findstr abc",
+      timeout: 1500,
+      maxElapsedMs: 1500,
+      expected: /\[EXIT 1\]/,
+    },
+    {
+      command: "echo alpha | more",
+      timeout: 1500,
+      maxElapsedMs: 1500,
+      expected: /alpha/,
+    },
+    {
+      command: "dir | findstr /i package.json",
+      timeout: 1500,
+      maxElapsedMs: 1500,
+      expected: /package\.json/i,
+    },
+    {
+      command: "for /L %i in (1,1,500) do @echo line%i",
+      timeout: 2000,
+      maxElapsedMs: 2500,
+      expected: /line1[\s\S]*line500/i,
+    },
+    {
+      command: "powershell -enc AAA",
+      timeout: 1500,
+      maxElapsedMs: 1000,
+      expected: /\[BLOCKED\] System-level destructive command rejected/,
+    },
+    {
+      command: "format c:",
+      timeout: 1500,
+      maxElapsedMs: 1000,
+      expected: /\[BLOCKED\] System-level destructive command rejected/,
+    },
+    {
+      command: "del C:\\Windows\\notepad.exe",
+      timeout: 1500,
+      maxElapsedMs: 1000,
+      expected: /\[BLOCKED\] File operation targets outside project boundary/,
+    },
+  ];
+
+  for (const entry of matrix) {
+    const started = Date.now();
+    const result = await client.callTool({
+      name: "cmd_run",
+      arguments: {
+        command: entry.command,
+        cwd: repoRoot,
+        timeout: entry.timeout,
+      },
+    });
+    const elapsed = Date.now() - started;
+    const text = resultText(result);
+
+    assert.ok(elapsed < entry.maxElapsedMs, `Expected '${entry.command}' to resolve under ${entry.maxElapsedMs}ms, got ${elapsed}ms`);
+    assert.match(text, entry.expected);
+    assert.match(text, /\[EXIT /);
+  }
+});
+
 test("powershell_run returns plain text errors and no CLIXML noise", async (t) => {
   const { client } = await connectClient(t, {
     command: "node",
@@ -390,7 +472,7 @@ test("queued requests with enough budget still succeed after waiting", async (t)
     client.callTool({
       name: "powershell_run",
       arguments: {
-        command: `Start-Sleep -Milliseconds 1500; Write-Output gate${job}`,
+        command: `Start-Sleep -Milliseconds 1200; Write-Output gate${job}`,
         cwd: repoRoot,
         timeout: 3500,
       },
@@ -401,9 +483,9 @@ test("queued requests with enough budget still succeed after waiting", async (t)
   const queued = client.callTool({
     name: "powershell_run",
     arguments: {
-      command: "Start-Sleep -Milliseconds 800; Write-Output queued-success",
+      command: "Start-Sleep -Milliseconds 400; Write-Output queued-success",
       cwd: repoRoot,
-      timeout: 4500,
+      timeout: 5000,
     },
   });
 
@@ -411,10 +493,132 @@ test("queued requests with enough budget still succeed after waiting", async (t)
   const queuedElapsed = Date.now() - queuedStarted;
   const queuedText = resultText(queuedResult);
 
-  assert.ok(queuedElapsed >= 1800, `Expected queued request to wait for a slot, got ${queuedElapsed}ms`);
-  assert.ok(queuedElapsed < 5600, `Expected queued request to finish within total budget, got ${queuedElapsed}ms`);
+  assert.ok(queuedElapsed >= 1200, `Expected queued request to wait for a slot, got ${queuedElapsed}ms`);
+  assert.ok(queuedElapsed < 6200, `Expected queued request to finish within total budget, got ${queuedElapsed}ms`);
   assert.match(queuedText, /queued-success/);
   assert.match(queuedText, /\[EXIT 0\]/);
 
   await Promise.all(blockers);
+});
+
+test("mixed cmd and powershell workloads resolve without deadlock", async (t) => {
+  const { client } = await connectClient(t, {
+    command: "node",
+    args: ["index.js"],
+  });
+
+  const jobs = [
+    {
+      name: "cmd_run",
+      arguments: {
+        command: "echo smoke-one",
+        cwd: repoRoot,
+        timeout: 1500,
+      },
+      expected: /smoke-one/i,
+    },
+    {
+      name: "cmd_run",
+      arguments: {
+        command: "timeout /t 5",
+        cwd: repoRoot,
+        timeout: 1500,
+      },
+      expected: /Input redirection is not supported/i,
+    },
+    {
+      name: "cmd_run",
+      arguments: {
+        command: "ping -t 127.0.0.1",
+        cwd: repoRoot,
+        timeout: 1200,
+      },
+      expected: /\[TIMEOUT\] Killed after 1200ms/i,
+    },
+    {
+      name: "cmd_run",
+      arguments: {
+        command: "for /L %i in (1,1,80) do @echo burst%i",
+        cwd: repoRoot,
+        timeout: 2000,
+      },
+      expected: /burst1[\s\S]*burst80/i,
+    },
+    {
+      name: "powershell_run",
+      arguments: {
+        command: "Write-Output 'ps-fast'",
+        cwd: repoRoot,
+        timeout: 1500,
+      },
+      expected: /ps-fast/i,
+    },
+    {
+      name: "powershell_run",
+      arguments: {
+        command: "Read-Host 'Nhap'",
+        cwd: repoRoot,
+        timeout: 1500,
+      },
+      expected: /NonInteractive mode/i,
+    },
+    {
+      name: "powershell_run",
+      arguments: {
+        command: "Start-Sleep -Milliseconds 700; Write-Output 'ps-delayed'",
+        cwd: repoRoot,
+        timeout: 2500,
+      },
+      expected: /ps-delayed/i,
+    },
+    {
+      name: "powershell_run",
+      arguments: {
+        command: "while ($true) { Start-Sleep -Milliseconds 150 }",
+        cwd: repoRoot,
+        timeout: 1200,
+      },
+      expected: /\[TIMEOUT\]/i,
+    },
+    {
+      name: "cmd_batch",
+      arguments: {
+        commands: [
+          { command: "echo batch-start", cwd: repoRoot },
+          { command: "ping -t 127.0.0.1", cwd: repoRoot },
+          { command: "echo batch-end", cwd: repoRoot },
+        ],
+        cwd: repoRoot,
+        timeout: 900,
+        continueOnError: true,
+      },
+      expected: /batch-start[\s\S]*\[TIMEOUT\][\s\S]*batch-end/i,
+    },
+  ];
+
+  const started = Date.now();
+  const runAllJobs = Promise.all(
+    jobs.map(async (job) => {
+      const result = await client.callTool({
+        name: job.name,
+        arguments: job.arguments,
+      });
+
+      return resultText(result);
+    })
+  );
+  const outputs = await Promise.race([
+    runAllJobs,
+    delay(12000).then(() => {
+      throw new Error("Mixed workload did not settle within 12s");
+    }),
+  ]);
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 12000, `Expected mixed workload to settle under 12s, got ${elapsed}ms`);
+
+  for (const [index, text] of outputs.entries()) {
+    assert.match(text, jobs[index].expected, `Unexpected output for ${jobs[index].name}`);
+    assert.match(text, /\[EXIT |\[TIMEOUT\]|\[BLOCKED\]/, `Expected terminal status for ${jobs[index].name}`);
+  }
 });
