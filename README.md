@@ -168,6 +168,20 @@ AI assistant của bạn giờ có thể chạy lệnh Windows mà **không bao 
 - **Node.js** v18+
 - **Windows** OS
 
+## Testing
+
+```bash
+npm test
+```
+
+The integration suite covers:
+- MCP stdio transport through `node index.js`
+- Wrapper startup through `wrapper.js`
+- Launcher startup through `launcher.exe`
+- Prompt/timeout anti-hang regression cases
+- Parallel execution queue behavior
+- Plain-text PowerShell error output
+
 ## License
 
 [MIT](LICENSE) © 2026 quangminh1212
