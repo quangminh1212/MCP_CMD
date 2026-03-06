@@ -10,6 +10,21 @@ const server = new McpServer({
   version: "1.1.0",
 });
 
+const DEFAULT_CWD = resolve(process.cwd());
+const COMMON_CHILD_ENV = {
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_EDITOR: "true",
+  GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+};
+const POWERSHELL_BASE_ARGS = [
+  "-NonInteractive",
+  "-NoProfile",
+  "-ExecutionPolicy",
+  "Bypass",
+  "-OutputFormat",
+  "Text",
+];
+
 // ─── Security Configuration ────────────────────────────────────────────────────
 // Inspired by MladenSU/cli-mcp-server security features
 const SECURITY_CONFIG = {
@@ -98,14 +113,18 @@ function destroyStreams(child) {
   try { child.stderr && !child.stderr.destroyed && child.stderr.destroy(); } catch (_) { }
 }
 
-// ─── Concurrency limiter (evict-oldest strategy) ────────────────────────────────
-// Max 3 simultaneous child processes. When full, kills the OLDEST to make room.
+// ─── Concurrency limiter (FIFO queue) ───────────────────────────────────────────
+// Max 3 simultaneous child processes. Extra work waits in a FIFO queue.
 const MAX_CONCURRENT = 3;
 const IDLE_TIMEOUT_MS = 20000; // 20s no-output → auto-kill (git ops can be slow)
+const PROCESS_CLOSE_GRACE_MS = 3000;
+const PROCESS_DEADLINE_GRACE_MS = 10000;
 
-// Track running processes with metadata for eviction
+// Track running processes with metadata for idle cleanup.
 // Each entry: { pid, startedAt, lastOutputAt, kill: () => void }
 const _runningProcs = new Map();
+const _spawnQueue = [];
+let _activeSlots = 0;
 
 function registerProc(pid, killFn, childRef) {
   const now = Date.now();
@@ -121,21 +140,34 @@ function unregisterProc(pid) {
   _runningProcs.delete(pid);
 }
 
-/**
- * Evict oldest running process if at capacity.
- * Called BEFORE spawning a new process.
- */
-function evictIfFull() {
-  if (_runningProcs.size < MAX_CONCURRENT) return;
-  // Find the oldest process (earliest startedAt)
-  let oldest = null;
-  for (const entry of _runningProcs.values()) {
-    if (!oldest || entry.startedAt < oldest.startedAt) oldest = entry;
+function drainSpawnQueue() {
+  while (_activeSlots < MAX_CONCURRENT && _spawnQueue.length > 0) {
+    const next = _spawnQueue.shift();
+    if (next) next();
   }
-  if (oldest) {
-    try { oldest.kill(); } catch (_) { /* best effort */ }
-    _runningProcs.delete(oldest.pid);
-  }
+}
+
+function acquireProcessSlot() {
+  return new Promise((resolve) => {
+    const grant = () => {
+      _activeSlots += 1;
+      let released = false;
+
+      resolve(() => {
+        if (released) return;
+        released = true;
+        _activeSlots = Math.max(0, _activeSlots - 1);
+        drainSpawnQueue();
+      });
+    };
+
+    if (_activeSlots < MAX_CONCURRENT) {
+      grant();
+      return;
+    }
+
+    _spawnQueue.push(grant);
+  });
 }
 
 // ─── Idle watchdog ──────────────────────────────────────────────────────────────
@@ -169,6 +201,171 @@ function forceKillTree(pid) {
   _activeChildren.delete(pid);
 }
 
+function buildPowerShellScript(script) {
+  return `$ProgressPreference = 'SilentlyContinue'; ${script}`;
+}
+
+function encodePowerShellScript(script) {
+  return Buffer.from(buildPowerShellScript(script), "utf16le").toString("base64");
+}
+
+async function runSpawnedProcess(options) {
+  const {
+    fileName,
+    args,
+    cwd = DEFAULT_CWD,
+    timeoutMs = SECURITY_CONFIG.commandTimeout,
+    maxOutput = SECURITY_CONFIG.maxOutputSize,
+    env = {},
+  } = options;
+
+  const releaseSlot = await acquireProcessSlot();
+
+  return new Promise((resolve) => {
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    let finished = false;
+    let timedOut = false;
+    let child;
+    let timer;
+    let deadlineTimer;
+
+    function done(exitCode, spawnError = null) {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      clearTimeout(deadlineTimer);
+
+      if (child?.pid) {
+        _activeChildren.delete(child.pid);
+        unregisterProc(child.pid);
+      }
+
+      destroyStreams(child);
+      releaseSlot();
+
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString().trim(),
+        stderr: Buffer.concat(stderrChunks).toString().trim(),
+        timedOut,
+        exitCode: exitCode ?? 1,
+        spawnError,
+      });
+    }
+
+    try {
+      child = spawn(fileName, args, {
+        cwd,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          ...COMMON_CHILD_ENV,
+          ...env,
+        },
+      });
+    } catch (spawnErr) {
+      done(1, spawnErr);
+      return;
+    }
+
+    if (child.pid) {
+      _activeChildren.add(child.pid);
+      registerProc(child.pid, () => forceKillTree(child.pid), child);
+    }
+
+    child.stdin.end();
+
+    child.stdin.on("error", () => { });
+    child.stdout.on("error", () => { });
+    child.stderr.on("error", () => { });
+
+    child.stdout.on("data", (chunk) => {
+      if (stdoutLen < maxOutput) {
+        stdoutChunks.push(chunk);
+        stdoutLen += chunk.length;
+      }
+      if (child.pid) touchProc(child.pid);
+    });
+
+    child.stderr.on("data", (chunk) => {
+      if (stderrLen < maxOutput) {
+        stderrChunks.push(chunk);
+        stderrLen += chunk.length;
+      }
+      if (child.pid) touchProc(child.pid);
+    });
+
+    timer = setTimeout(() => {
+      if (finished) return;
+      timedOut = true;
+      forceKillTree(child.pid);
+      destroyStreams(child);
+      const closeTimer = setTimeout(() => done(null), PROCESS_CLOSE_GRACE_MS);
+      closeTimer.unref && closeTimer.unref();
+    }, timeoutMs);
+
+    deadlineTimer = setTimeout(() => {
+      if (finished) return;
+      timedOut = true;
+      forceKillTree(child.pid);
+      destroyStreams(child);
+      done(null);
+    }, timeoutMs + PROCESS_DEADLINE_GRACE_MS);
+    deadlineTimer.unref && deadlineTimer.unref();
+
+    child.on("exit", (code) => {
+      const exitTimer = setTimeout(() => {
+        if (!finished) {
+          destroyStreams(child);
+          done(code);
+        }
+      }, 2000);
+      exitTimer.unref && exitTimer.unref();
+    });
+
+    child.on("close", (code) => done(code));
+    child.on("error", (err) => {
+      stderrChunks.push(Buffer.from(err.message));
+      stderrLen += Buffer.byteLength(err.message);
+      done(1, err);
+    });
+  });
+}
+
+function buildToolResultText(result, options = {}) {
+  const { timeoutMs, securityPrefix = "" } = options;
+  const parts = [];
+
+  if (securityPrefix) parts.push(securityPrefix.trim());
+  if (result.stdout) parts.push(result.stdout);
+  if (result.stderr) parts.push(`[STDERR] ${result.stderr}`);
+  if (result.timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
+  else if (result.exitCode !== 0 && !result.stdout && !result.stderr) {
+    parts.push(`[ERROR] Process exited with code ${result.exitCode}`);
+  }
+  parts.push(`[EXIT ${result.exitCode}]`);
+
+  return parts.join("\n") || "[NO OUTPUT]";
+}
+
+function decodePowerShellClixml(text) {
+  if (!text || !text.includes("CLIXML")) return text;
+
+  const decodedSegments = [...text.matchAll(/<S S="[^"]+">(.*?)<\/S>/g)]
+    .map(([, segment]) => segment
+      .replace(/_x000D__x000A_/g, "\n")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&"))
+    .join("")
+    .trim();
+
+  return decodedSegments.replace(/\n{3,}/g, "\n\n");
+}
+
 /**
  * Anti-hang CMD execution using spawn (not exec) for full control.
  * - Spawns cmd.exe /c <command> directly via spawn for proper PID tracking
@@ -178,158 +375,55 @@ function forceKillTree(pid) {
  * - Uses spawn instead of exec to avoid exec's unreliable timeout on Windows
  */
 async function execCmd(command, options = {}) {
-  const cwd = options.cwd || "C:\\Dev";
+  const cwd = options.cwd || DEFAULT_CWD;
   const timeoutMs = Math.max(100, Math.min(options.timeout || SECURITY_CONFIG.commandTimeout, SECURITY_CONFIG.maxTimeout));
-  const maxOutput = SECURITY_CONFIG.maxOutputSize;
 
-  // Security analysis
   const analysis = analyzeCommand(command);
   const securityPrefix = analysis.warnings.length > 0 ? analysis.warnings.join('\n') + '\n' : '';
 
-  // BLOCK system-level dangerous commands (format, diskpart, shutdown, etc.)
   if (analysis.alwaysBlocked) {
     return { content: [{ type: "text", text: `${securityPrefix}[BLOCKED] System-level destructive command rejected.\n[EXIT 1]` }] };
   }
 
-  // File-destructive commands: only allowed within cwd under allowedBaseDir
   if (analysis.fileDestructive && !isFileOpSafe(command, cwd)) {
     return { content: [{ type: "text", text: `${securityPrefix}[BLOCKED] File operation targets outside project boundary (${cwd}).\nFile deletion is only allowed within a recognized project directory (detected via .git, package.json, etc.).\n[EXIT 1]` }] };
   }
 
-  // Reject commands exceeding max length
   if (command.length > SECURITY_CONFIG.maxCommandLength) {
     return { content: [{ type: "text", text: `[SECURITY] Command rejected: exceeds max length (${command.length}/${SECURITY_CONFIG.maxCommandLength})\n[EXIT 1]` }] };
   }
 
-  // Evict oldest process if at capacity (instead of queuing)
-  evictIfFull();
-
-  return new Promise((resolve) => {
-    const stdoutChunks = [];
-    const stderrChunks = [];
-    let stdoutLen = 0;
-    let stderrLen = 0;
-    let finished = false;
-    let timedOut = false;
-
-    let child;
-    try {
-      child = spawn("cmd.exe", ["/c", command], {
-        cwd,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          GIT_TERMINAL_PROMPT: "0",     // Prevent git from prompting for credentials
-          GIT_EDITOR: "true",            // Prevent git commit from opening editor
-          GIT_SSH_COMMAND: "ssh -o BatchMode=yes", // Prevent SSH passphrase prompt
-        },
-      });
-    } catch (spawnErr) {
-      resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
-      return;
-    }
-
-    if (child.pid) _activeChildren.add(child.pid);
-
-    child.stdin.end();
-
-    child.stdin.on("error", () => { });
-    child.stdout.on("error", () => { });
-    child.stderr.on("error", () => { });
-
-    child.stdout.on("data", (d) => {
-      if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; }
-      if (child.pid) touchProc(child.pid); // Reset idle timer on output
-    });
-    child.stderr.on("data", (d) => {
-      if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; }
-      if (child.pid) touchProc(child.pid); // Reset idle timer on output
-    });
-
-    const timer = setTimeout(() => {
-      if (!finished) {
-        timedOut = true;
-        forceKillTree(child.pid);
-        // Destroy streams to unblock "close" event (grandchild may hold pipes)
-        destroyStreams(child);
-        // Emergency force-resolve: if "close" still doesn't fire after 3s
-        setTimeout(() => { done(null); }, 3000);
-      }
-    }, timeoutMs);
-
-    // Absolute deadline: if Promise hasn't resolved after timeoutMs + 10s,
-    // force-resolve to prevent MCP server from hanging indefinitely
-    const deadlineTimer = setTimeout(() => {
-      if (!finished) {
-        timedOut = true;
-        forceKillTree(child.pid);
-        destroyStreams(child);
-        done(null);
-      }
-    }, timeoutMs + 10000);
-    deadlineTimer.unref && deadlineTimer.unref();
-
-    function done(exitCode) {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      clearTimeout(deadlineTimer);
-      _activeChildren.delete(child.pid);
-      unregisterProc(child.pid);
-      // Ensure streams are destroyed to prevent resource leaks
-      destroyStreams(child);
-
-      const stdout = Buffer.concat(stdoutChunks).toString().trim();
-      const stderr = Buffer.concat(stderrChunks).toString().trim();
-      const parts = [];
-      if (securityPrefix) parts.push(securityPrefix.trim());
-      if (stdout) parts.push(stdout);
-      if (stderr) parts.push(`[STDERR] ${stderr}`);
-      if (timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
-      else if (exitCode !== 0 && !stdout && !stderr) {
-        parts.push(`[ERROR] Process exited with code ${exitCode}`);
-      }
-      parts.push(`[EXIT ${exitCode ?? 1}]`);
-
-      resolve({
-        content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }],
-      });
-    }
-
-    // Register for eviction + idle tracking (pass child ref for stream cleanup)
-    if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid), child);
-
-    // "exit" fires when process terminates, even if streams are still open.
-    // Use as backup: if "close" doesn't fire within 2s after "exit", force-done.
-    child.on("exit", (code) => {
-      setTimeout(() => {
-        if (!finished) {
-          destroyStreams(child);
-          done(code);
-        }
-      }, 2000);
-    });
-    child.on("close", (code) => done(code));
-    child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
+  const result = await runSpawnedProcess({
+    fileName: "cmd.exe",
+    args: ["/c", command],
+    cwd,
+    timeoutMs,
+    maxOutput: SECURITY_CONFIG.maxOutputSize,
   });
+
+  return {
+    content: [{ type: "text", text: buildToolResultText(result, { timeoutMs, securityPrefix }) }],
+  };
 }
 
-// Helper: run PowerShell synchronously (replaces deprecated WMIC)
-// Uses spawnSync with argv array for reliable windowsHide (no console flash)
-function psSync(script, timeoutMs = 10000) {
+// Helper: run PowerShell with GUARANTEED timeout (async, anti-hang)
+// Uses the same process lifecycle manager as the main tools to avoid deadlocks.
+async function psSafe(script, timeoutMs = 10000) {
+  let encoded;
   try {
-    const encoded = Buffer.from(script, "utf16le").toString("base64");
-    const result = spawnSync(
-      "powershell.exe",
-      ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-      { encoding: "utf8", windowsHide: true, timeout: timeoutMs, stdio: ["ignore", "pipe", "pipe"] }
-    );
-    return result.stdout || "";
-  } catch (err) {
-    // Return empty on failure instead of crashing the MCP server
+    encoded = encodePowerShellScript(script);
+  } catch (_) {
     return "";
   }
+
+  const result = await runSpawnedProcess({
+    fileName: "powershell.exe",
+    args: [...POWERSHELL_BASE_ARGS, "-EncodedCommand", encoded],
+    timeoutMs,
+    maxOutput: SECURITY_CONFIG.maxOutputSize / 2,
+  });
+
+  return result.stdout || "";
 }
 
 // Rate limiter: prevents abuse of process management tools (60 calls/min)
@@ -346,19 +440,19 @@ function rateCheck(tool) {
 // Validate working directory to prevent path traversal
 // Enhanced with symlink resolution and traversal prevention (inspired by cli-mcp-server)
 function validateCwd(cwd) {
-  if (!cwd) return "C:\\Dev";
+  if (!cwd) return DEFAULT_CWD;
   // Block null bytes
-  if (cwd.includes('\0')) return "C:\\Dev";
+  if (cwd.includes('\0')) return DEFAULT_CWD;
   try {
     // Normalize and resolve to absolute path to prevent traversal via ../ or ./ 
     const resolved = resolve(normalize(cwd));
     // Block UNC paths that could access network resources
-    if (resolved.startsWith('\\\\')) return "C:\\Dev";
+    if (resolved.startsWith('\\\\')) return DEFAULT_CWD;
     // Block paths with suspicious double-dot sequences post-resolution
-    if (resolved.includes('..')) return "C:\\Dev";
+    if (resolved.includes('..')) return DEFAULT_CWD;
     return resolved;
   } catch (_) {
-    return "C:\\Dev";
+    return DEFAULT_CWD;
   }
 }
 
@@ -443,7 +537,7 @@ server.tool(
   "Run a Windows CMD command without hanging. Uses cmd.exe /c with stdin closed and process tree kill on timeout. Safe for any non-interactive command.",
   {
     command: z.string().describe("The CMD command to run"),
-    cwd: z.string().optional().describe("Working directory. Defaults to C:\\Dev"),
+    cwd: z.string().optional().describe("Working directory. Defaults to the server start directory."),
     timeout: z
       .number()
       .optional()
@@ -512,7 +606,7 @@ server.tool(
   "Run a PowerShell command without hanging. Uses -NonInteractive -NoProfile flags to prevent prompts and speed up startup. Command is Base64-encoded to avoid escaping issues.",
   {
     command: z.string().describe("PowerShell command or script block to run"),
-    cwd: z.string().optional().describe("Working directory. Defaults to C:\\Dev"),
+    cwd: z.string().optional().describe("Working directory. Defaults to the server start directory."),
     timeout: z
       .number()
       .optional()
@@ -521,120 +615,24 @@ server.tool(
   async ({ command, cwd, timeout }) => {
     const workDir = validateCwd(cwd);
     const timeoutMs = Math.max(100, Math.min(timeout || SECURITY_CONFIG.commandTimeout, SECURITY_CONFIG.maxTimeout));
-    const maxOutput = SECURITY_CONFIG.maxOutputSize / 2; // 5MB for PS (half of CMD limit)
-
-    // Evict oldest process if at capacity
-    evictIfFull();
 
     let encoded;
     try {
-      encoded = Buffer.from(command, "utf16le").toString("base64");
+      encoded = encodePowerShellScript(command);
     } catch (encErr) {
       return { content: [{ type: "text", text: `[ERROR] Failed to encode command: ${encErr.message}\n[EXIT 1]` }] };
     }
 
-    return new Promise((resolve) => {
-      const stdoutChunks = [];
-      const stderrChunks = [];
-      let stdoutLen = 0;
-      let stderrLen = 0;
-      let finished = false;
-      let timedOut = false;
-
-      // SECURITY NOTE: -ExecutionPolicy Bypass is intentional for MCP server operation.
-      let child;
-      try {
-        child = spawn(
-          "powershell.exe",
-          ["-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-          {
-            cwd: workDir, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
-            env: {
-              ...process.env,
-              GIT_TERMINAL_PROMPT: "0",
-              GIT_EDITOR: "true",
-              GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
-            },
-          }
-        );
-      } catch (spawnErr) {
-        resolve({ content: [{ type: "text", text: `[ERROR] Spawn failed: ${spawnErr.message}\n[EXIT 1]` }] });
-        return;
-      }
-
-      if (child.pid) _activeChildren.add(child.pid);
-
-      child.stdin.end();
-
-      child.stdin.on("error", () => { });
-      child.stdout.on("error", () => { });
-      child.stderr.on("error", () => { });
-
-      child.stdout.on("data", (d) => {
-        if (stdoutLen < maxOutput) { stdoutChunks.push(d); stdoutLen += d.length; }
-        if (child.pid) touchProc(child.pid);
-      });
-      child.stderr.on("data", (d) => {
-        if (stderrLen < maxOutput) { stderrChunks.push(d); stderrLen += d.length; }
-        if (child.pid) touchProc(child.pid);
-      });
-
-      const timer = setTimeout(() => {
-        if (!finished) {
-          timedOut = true;
-          forceKillTree(child.pid);
-          // Destroy streams to unblock "close" event
-          destroyStreams(child);
-          // Emergency force-resolve after 3s
-          setTimeout(() => { done(null); }, 3000);
-        }
-      }, timeoutMs);
-
-      // Absolute deadline: if Promise hasn't resolved after timeoutMs + 10s,
-      // force-resolve to prevent MCP server from hanging indefinitely
-      const deadlineTimer = setTimeout(() => {
-        if (!finished) {
-          timedOut = true;
-          forceKillTree(child.pid);
-          destroyStreams(child);
-          done(null);
-        }
-      }, timeoutMs + 10000);
-      deadlineTimer.unref && deadlineTimer.unref();
-
-      function done(exitCode) {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        clearTimeout(deadlineTimer);
-        _activeChildren.delete(child.pid);
-        unregisterProc(child.pid);
-        destroyStreams(child);
-
-        const stdout = Buffer.concat(stdoutChunks).toString().trim();
-        const stderr = Buffer.concat(stderrChunks).toString().trim();
-        const parts = [];
-        if (stdout) parts.push(stdout);
-        if (stderr) parts.push(`[STDERR] ${stderr}`);
-        if (timedOut) parts.push(`[TIMEOUT] Killed after ${timeoutMs}ms`);
-        parts.push(`[EXIT ${exitCode ?? "?"}]`);
-        resolve({ content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }] });
-      }
-
-      if (child.pid) registerProc(child.pid, () => forceKillTree(child.pid), child);
-
-      // "exit" event backup: force-done if "close" doesn't fire within 2s
-      child.on("exit", (code) => {
-        setTimeout(() => {
-          if (!finished) {
-            destroyStreams(child);
-            done(code);
-          }
-        }, 2000);
-      });
-      child.on("close", (code) => done(code));
-      child.on("error", (err) => { stderrChunks.push(Buffer.from(err.message)); stderrLen += err.message.length; done(1); });
+    const result = await runSpawnedProcess({
+      fileName: "powershell.exe",
+      args: [...POWERSHELL_BASE_ARGS, "-EncodedCommand", encoded],
+      cwd: workDir,
+      timeoutMs,
+      maxOutput: SECURITY_CONFIG.maxOutputSize / 2,
     });
+
+    result.stderr = decodePowerShellClixml(result.stderr);
+    return { content: [{ type: "text", text: buildToolResultText(result, { timeoutMs }) }] };
   }
 );
 
@@ -646,7 +644,7 @@ server.tool(
   {},
   async () => {
     // Use PowerShell for reliable system info (avoids FINDSTR quoting issues in cmd.exe /c)
-    const output = psSync(
+    const output = await psSafe(
       `$os = Get-CimInstance Win32_OperatingSystem; ` +
       `"OS: $($os.Caption) $($os.Version)"; ` +
       `"ARCH: $env:PROCESSOR_ARCHITECTURE"; ` +
@@ -684,11 +682,14 @@ server.tool(
       : "Name='cmd.exe' OR Name='conhost.exe' OR Name='powershell.exe' OR Name='node.exe'";
 
     try {
-      // PowerShell Get-CimInstance (replaces deprecated WMIC)
-      const output = psSync(`Get-CimInstance Win32_Process -Filter \"(${filterExpr})\" | Select-Object ProcessId,Name,CreationDate,CommandLine | Format-List`);
-      return { content: [{ type: "text", text: output.trim() || "[NO PROCESSES FOUND]" }] };
+      // PowerShell Get-CimInstance (replaces deprecated WMIC) - uses async psSafe to prevent hang
+      const output = await psSafe(`Get-CimInstance Win32_Process -Filter \"(${filterExpr})\" | Select-Object ProcessId,Name,CreationDate,CommandLine | Format-List`, 15000);
+      if (output.trim()) {
+        return { content: [{ type: "text", text: output.trim() }] };
+      }
+      // Empty output = fallback to WMIC for older Windows versions
+      return execCmd(`wmic process where "(${filterExpr})" get ProcessId,Name,CreationDate,CommandLine /format:list`, { timeout: 10000 });
     } catch (_) {
-      // Fallback to WMIC for older Windows versions
       return execCmd(`wmic process where "(${filterExpr})" get ProcessId,Name,CreationDate,CommandLine /format:list`, { timeout: 10000 });
     }
   }
@@ -755,23 +756,22 @@ server.tool(
       if (includeNode) targets.push("node.exe");
       const nameFilter = targets.map(n => `Name='${n}'`).join(" OR ");
 
-      // PowerShell Get-CimInstance + JSON (replaces deprecated WMIC + fragile CSV)
+      // PowerShell Get-CimInstance + JSON (uses async psSafe to prevent hang)
       let procs = [];
       try {
         const script = `@(Get-CimInstance Win32_Process -Filter \"(${nameFilter})\" -EA SilentlyContinue | Select-Object ProcessId, Name, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`;
-        const raw = psSync(script);
+        const raw = await psSafe(script, 15000);
         const parsed = JSON.parse(raw.trim() || "[]");
         procs = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
       } catch (_) {
-        // Fallback to WMIC for older Windows
+        // Fallback to WMIC for older Windows (also with timeout via execCmd)
         try {
-          const wmicResult = spawnSync(
-            "wmic",
-            ["process", "where", `(${nameFilter})`, "get", "ProcessId,Name,CreationDate,CommandLine", "/format:csv"],
-            { encoding: "utf8", windowsHide: true, timeout: 10000, stdio: ["ignore", "pipe", "pipe"] }
+          const wmicResult = await execCmd(
+            `wmic process where "(${nameFilter})" get ProcessId,Name,CreationDate,CommandLine /format:csv`,
+            { timeout: 10000 }
           );
-          const raw = wmicResult.stdout || "";
-          const lines = raw.trim().split("\n").filter(l => l.trim() && !l.startsWith("Node"));
+          const raw = wmicResult.content[0].text || "";
+          const lines = raw.trim().split("\n").filter(l => l.trim() && !l.startsWith("Node") && !l.startsWith("["));
           for (const line of lines) {
             const m = line.trim().match(/^([^,]*),(.*),(\d{14}\.\d+\+\d+),([^,]+),(\d+)\s*$/);
             if (!m) continue;
@@ -858,6 +858,8 @@ server.tool(
       `Concurrency:`,
       `  Max Concurrent Processes: ${MAX_CONCURRENT}`,
       `  Idle Timeout: ${IDLE_TIMEOUT_MS}ms`,
+      `  Queue Depth: ${_spawnQueue.length}`,
+      `  Active Slots: ${_activeSlots}`,
       `  Active Processes: ${_runningProcs.size}`,
       `  Tracked Children: ${_activeChildren.size}`,
       ``,
@@ -872,7 +874,7 @@ server.tool(
       `  ✅ MCP infrastructure process protection (${MCP_PATTERNS.length} patterns)`,
       `  ✅ Rate limiting on process management tools`,
       `  ✅ Idle watchdog auto-kill`,
-      `  ✅ Evict-oldest concurrency strategy`,
+      `  ✅ FIFO concurrency queue`,
       ``,
       `Shell Operators Monitored:`,
       `  ${SHELL_OPERATORS.join('  ')}`,
