@@ -118,7 +118,10 @@ function destroyStreams(child) {
 const MAX_CONCURRENT = 3;
 const IDLE_TIMEOUT_MS = 20000; // 20s no-output → auto-kill (balanced for slow tasks like git, PS)
 const ABSOLUTE_MAX_LIFETIME_MS = 60000; // 60s absolute max → kill regardless of output
-const PROCESS_CLOSE_GRACE_MS = 3000;
+const PROCESS_CLOSE_GRACE_MS = 500;
+const PROCESS_EXIT_FALLBACK_MS = 250;
+const PROCESS_POST_TIMEOUT_SETTLE_MS = 500;
+const PROCESS_STREAM_SETTLE_MS = 50;
 const PROCESS_DEADLINE_GRACE_MS = 10000;
 
 // Track running processes with metadata for idle cleanup.
@@ -232,6 +235,11 @@ function encodePowerShellScript(script) {
   return Buffer.from(buildPowerShellScript(script), "utf16le").toString("base64");
 }
 
+function needsPostTimeoutSettle(fileName, args) {
+  if (!fileName || fileName.toLowerCase() !== "cmd.exe") return false;
+  return args.some((arg) => /\bstart\b/i.test(arg));
+}
+
 async function runSpawnedProcess(options) {
   const {
     fileName,
@@ -241,6 +249,7 @@ async function runSpawnedProcess(options) {
     maxOutput = SECURITY_CONFIG.maxOutputSize,
     env = {},
   } = options;
+  const postTimeoutSettle = needsPostTimeoutSettle(fileName, args) ? PROCESS_POST_TIMEOUT_SETTLE_MS : 0;
 
   const startedAt = Date.now();
   const releaseSlot = await acquireProcessSlot(timeoutMs);
@@ -271,31 +280,65 @@ async function runSpawnedProcess(options) {
     let child;
     let timer;
     let deadlineTimer;
+    let closeTimer;
+    let exitTimer;
+    let finalizeTimer;
 
     function done(exitCode, spawnError = null) {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
       clearTimeout(deadlineTimer);
+      clearTimeout(closeTimer);
+      clearTimeout(exitTimer);
+      clearTimeout(finalizeTimer);
 
       if (child?.pid) {
         _activeChildren.delete(child.pid);
         unregisterProc(child.pid);
       }
 
-      destroyStreams(child);
-      releaseSlot();
+      const finish = () => {
+        destroyStreams(child);
+        releaseSlot();
+        resolve({
+          stdout: Buffer.concat(stdoutChunks).toString().trim(),
+          stderr: Buffer.concat(stderrChunks).toString().trim(),
+          timedOut,
+          queueTimedOut: false,
+          queueWaitMs,
+          runtimeTimeoutMs,
+          exitCode: exitCode ?? 1,
+          spawnError,
+        });
+      };
 
-      resolve({
-        stdout: Buffer.concat(stdoutChunks).toString().trim(),
-        stderr: Buffer.concat(stderrChunks).toString().trim(),
-        timedOut,
-        queueTimedOut: false,
-        queueWaitMs,
-        runtimeTimeoutMs,
-        exitCode: exitCode ?? 1,
-        spawnError,
-      });
+      if (timedOut && postTimeoutSettle > 0) {
+        const settleTimer = setTimeout(finish, postTimeoutSettle);
+        settleTimer.unref && settleTimer.unref();
+        return;
+      }
+
+      finish();
+    }
+
+    function scheduleFinalize(exitCode, destroyBeforeDone = false) {
+      clearTimeout(finalizeTimer);
+      finalizeTimer = setTimeout(() => {
+        if (finished) return;
+        if (destroyBeforeDone) destroyStreams(child);
+        done(exitCode);
+      }, PROCESS_STREAM_SETTLE_MS);
+      finalizeTimer.unref && finalizeTimer.unref();
+    }
+
+    function scheduleForcedClose(exitCode = null) {
+      clearTimeout(closeTimer);
+      closeTimer = setTimeout(() => {
+        if (finished) return;
+        scheduleFinalize(exitCode, true);
+      }, PROCESS_CLOSE_GRACE_MS);
+      closeTimer.unref && closeTimer.unref();
     }
 
     try {
@@ -345,9 +388,7 @@ async function runSpawnedProcess(options) {
       if (finished) return;
       timedOut = true;
       forceKillTree(child.pid);
-      destroyStreams(child);
-      const closeTimer = setTimeout(() => done(null), PROCESS_CLOSE_GRACE_MS);
-      closeTimer.unref && closeTimer.unref();
+      scheduleForcedClose(null);
     }, runtimeTimeoutMs);
 
     deadlineTimer = setTimeout(() => {
@@ -360,16 +401,16 @@ async function runSpawnedProcess(options) {
     deadlineTimer.unref && deadlineTimer.unref();
 
     child.on("exit", (code) => {
-      const exitTimer = setTimeout(() => {
+      clearTimeout(exitTimer);
+      exitTimer = setTimeout(() => {
         if (!finished) {
-          destroyStreams(child);
-          done(code);
+          scheduleFinalize(code);
         }
-      }, 2000);
+      }, PROCESS_EXIT_FALLBACK_MS);
       exitTimer.unref && exitTimer.unref();
     });
 
-    child.on("close", (code) => done(code));
+    child.on("close", (code) => scheduleFinalize(code));
     child.on("error", (err) => {
       stderrChunks.push(Buffer.from(err.message));
       stderrLen += Buffer.byteLength(err.message);
