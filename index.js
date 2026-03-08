@@ -988,6 +988,8 @@ async function zombieReaper() {
     const lines = output.split('\n').filter(l => l.trim() && !l.startsWith('Node'));
     let killedCount = 0;
 
+    // Phase 1: Parse all cmd.exe processes
+    const allProcs = [];
     for (const line of lines) {
       // CSV format: Node,CommandLine,CreationDate,ProcessId
       const parts = line.trim().split(',');
@@ -1007,13 +1009,43 @@ async function zombieReaper() {
       const created = new Date(dm[1], dm[2] - 1, dm[3], dm[4], dm[5], dm[6]);
       const ageSec = Math.round((now - created.getTime()) / 1000);
 
-      if (ageSec < ZOMBIE_AGE_LIMIT_SEC) continue;
-      if (isMcpInfrastructure(cmdLine, 'cmd.exe')) continue;
+      allProcs.push({ pidNum, cmdLine, created, ageSec });
+    }
 
-      // This is a zombie cmd.exe - kill it
-      process.stderr.write(`[MCP_CMD] Zombie reaper: killing PID ${pidNum} (age=${ageSec}s, cmd=${cmdLine.substring(0, 60)})\n`);
-      forceKillTree(pidNum);
+    // Phase 2: Kill non-MCP zombie processes (older than age limit)
+    for (const proc of allProcs) {
+      if (proc.ageSec < ZOMBIE_AGE_LIMIT_SEC) continue;
+      if (isMcpInfrastructure(proc.cmdLine, 'cmd.exe')) continue;
+
+      process.stderr.write(`[MCP_CMD] Zombie reaper: killing PID ${proc.pidNum} (age=${proc.ageSec}s, cmd=${proc.cmdLine.substring(0, 60)})\n`);
+      forceKillTree(proc.pidNum);
+      proc._killed = true;
       killedCount++;
+    }
+
+    // Phase 3: Kill DUPLICATE MCP instances (zombie MCP processes from old Antigravity sessions)
+    // When Antigravity restarts, old MCP server processes become zombies but are protected
+    // by isMcpInfrastructure(). Detect duplicates: same CommandLine → keep only newest.
+    const cmdGroups = new Map();
+    for (const proc of allProcs) {
+      if (proc._killed) continue;
+      const key = proc.cmdLine.toLowerCase().trim();
+      if (!key) continue;
+      if (!cmdGroups.has(key)) cmdGroups.set(key, []);
+      cmdGroups.get(key).push(proc);
+    }
+
+    for (const [, group] of cmdGroups) {
+      if (group.length <= 1) continue; // No duplicates
+      // Sort by creation time descending (newest first)
+      group.sort((a, b) => b.created.getTime() - a.created.getTime());
+      // Kill all but the newest
+      for (let i = 1; i < group.length; i++) {
+        const old = group[i];
+        process.stderr.write(`[MCP_CMD] Zombie reaper: killing DUPLICATE PID ${old.pidNum} (age=${old.ageSec}s, kept PID ${group[0].pidNum}, cmd=${old.cmdLine.substring(0, 60)})\n`);
+        forceKillTree(old.pidNum);
+        killedCount++;
+      }
     }
 
     if (killedCount > 0) {
