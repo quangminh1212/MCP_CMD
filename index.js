@@ -29,7 +29,7 @@ const POWERSHELL_BASE_ARGS = [
 // Inspired by MladenSU/cli-mcp-server security features
 const SECURITY_CONFIG = {
   maxCommandLength: 8192,         // Max command string length (bytes)
-  commandTimeout: 10000,          // Default timeout (ms)
+  commandTimeout: 10000,          // Default timeout (ms) - tasks > 10s auto-killed
   maxTimeout: 30000,              // Max allowed timeout (ms) - 30s for chained commands
   maxOutputSize: 10 * 1024 * 1024, // 10MB output cap
   maxBatchSize: 20,               // Max commands per batch
@@ -116,7 +116,8 @@ function destroyStreams(child) {
 // ─── Concurrency limiter (FIFO queue) ───────────────────────────────────────────
 // Max 3 simultaneous child processes. Extra work waits in a FIFO queue.
 const MAX_CONCURRENT = 3;
-const IDLE_TIMEOUT_MS = 20000; // 20s no-output → auto-kill (git ops can be slow)
+const IDLE_TIMEOUT_MS = 10000; // 10s no-output → auto-kill (user requirement)
+const ABSOLUTE_MAX_LIFETIME_MS = 40000; // 40s absolute max → kill regardless of output
 const PROCESS_CLOSE_GRACE_MS = 3000;
 const PROCESS_DEADLINE_GRACE_MS = 10000;
 
@@ -186,12 +187,18 @@ function acquireProcessSlot(timeoutMs) {
   });
 }
 
-// ─── Idle watchdog ──────────────────────────────────────────────────────────────
-// Every 3s, check for processes with no output for IDLE_TIMEOUT_MS → kill them
+// ─── Idle + Lifetime watchdog ───────────────────────────────────────────────────
+// Every 3s, check for:
+//   1. Idle processes (no output for IDLE_TIMEOUT_MS) → kill
+//   2. Long-running processes (alive > ABSOLUTE_MAX_LIFETIME_MS) → kill regardless
 const _idleWatchdog = setInterval(() => {
   const now = Date.now();
   for (const [pid, entry] of _runningProcs) {
-    if (now - entry.lastOutputAt > IDLE_TIMEOUT_MS) {
+    const idleMs = now - entry.lastOutputAt;
+    const lifetimeMs = now - entry.startedAt;
+    if (idleMs > IDLE_TIMEOUT_MS || lifetimeMs > ABSOLUTE_MAX_LIFETIME_MS) {
+      const reason = lifetimeMs > ABSOLUTE_MAX_LIFETIME_MS ? 'lifetime exceeded' : 'idle timeout';
+      process.stderr.write(`[MCP_CMD] Watchdog: killing PID ${pid} (${reason}, idle=${Math.round(idleMs / 1000)}s, lifetime=${Math.round(lifetimeMs / 1000)}s)\n`);
       try { entry.kill(); } catch (_) { /* best effort */ }
       // Destroy streams to unblock "close" event after kill
       if (entry.child) destroyStreams(entry.child);
@@ -900,10 +907,16 @@ server.tool(
       `Concurrency:`,
       `  Max Concurrent Processes: ${MAX_CONCURRENT}`,
       `  Idle Timeout: ${IDLE_TIMEOUT_MS}ms`,
+      `  Absolute Max Lifetime: ${ABSOLUTE_MAX_LIFETIME_MS}ms`,
       `  Queue Depth: ${_spawnQueue.length}`,
       `  Active Slots: ${_activeSlots}`,
       `  Active Processes: ${_runningProcs.size}`,
       `  Tracked Children: ${_activeChildren.size}`,
+      ``,
+      `Zombie Reaper:`,
+      `  Scan Interval: ${ZOMBIE_SCAN_INTERVAL_MS}ms`,
+      `  Age Limit: ${ZOMBIE_AGE_LIMIT_SEC}s`,
+      `  Status: ENABLED`,
       ``,
       `Security Features:`,
       `  ✅ Path traversal prevention (resolve + normalize + UNC block)`,
@@ -916,6 +929,8 @@ server.tool(
       `  ✅ MCP infrastructure process protection (${MCP_PATTERNS.length} patterns)`,
       `  ✅ Rate limiting on process management tools`,
       `  ✅ Idle watchdog auto-kill`,
+      `  ✅ Absolute lifetime enforcement (${ABSOLUTE_MAX_LIFETIME_MS}ms max)`,
+      `  ✅ Background zombie reaper (every ${ZOMBIE_SCAN_INTERVAL_MS / 1000}s)`,
       `  ✅ FIFO concurrency queue`,
       `  ✅ Per-request timeout includes queue wait`,
       ``,
@@ -938,14 +953,84 @@ server.tool(
   }
 );
 
-// ─── Background Auto-Reaper (DISABLED) ─────────────────────────────────────────
-// DISABLED: The auto-reaper was spawning a PowerShell process every 30s which
-// caused visible CMD/PowerShell windows to flash on Windows (even with windowsHide).
-// This is unnecessary because:
-//   1. execCmd() already has its own timeout + forceKillTree
-//   2. powershell_run() already has its own timeout + forceKillTree
-//   3. Users can manually call process_cleanup tool when needed
-// The reaper function is kept for potential manual use but the interval is removed.
+// ─── Background Zombie Reaper ──────────────────────────────────────────────────
+// Periodically scan for orphaned cmd.exe processes and kill them.
+// Uses cmd.exe "wmic" (no PowerShell flash) to check for old hanging cmd.exe
+// processes that are NOT MCP infrastructure.
+const ZOMBIE_SCAN_INTERVAL_MS = 30000; // 30s scan interval
+const ZOMBIE_AGE_LIMIT_SEC = 30; // Kill cmd.exe processes older than 30s
+
+async function zombieReaper() {
+  try {
+    // Use wmic via cmd.exe (no window flash via spawn windowsHide:true)
+    const child = spawn('cmd.exe', ['/c',
+      'wmic process where "Name=\'cmd.exe\'" get ProcessId,CreationDate,CommandLine /format:csv'
+    ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stdin.end();
+
+    let output = '';
+    child.stdout.on('data', (chunk) => { output += chunk.toString(); });
+
+    // Safety timeout for wmic itself
+    const wmicTimer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch (_) { }
+    }, 8000);
+    wmicTimer.unref && wmicTimer.unref();
+
+    await new Promise((resolve) => {
+      child.on('close', resolve);
+      child.on('error', resolve);
+    });
+    clearTimeout(wmicTimer);
+
+    const now = Date.now();
+    const myPid = process.pid;
+    const lines = output.split('\n').filter(l => l.trim() && !l.startsWith('Node'));
+    let killedCount = 0;
+
+    for (const line of lines) {
+      // CSV format: Node,CommandLine,CreationDate,ProcessId
+      const parts = line.trim().split(',');
+      if (parts.length < 4) continue;
+
+      // Reconstruct CommandLine (may contain commas)
+      const pidStr = parts[parts.length - 1].trim();
+      const dateStr = parts[parts.length - 2].trim();
+      const cmdLine = parts.slice(1, parts.length - 2).join(',').trim();
+
+      const pidNum = parseInt(pidStr);
+      if (!pidNum || isNaN(pidNum) || pidNum === myPid) continue;
+
+      // Parse WMI date (yyyymmddHHMMSS.ffffff+UUU)
+      const dm = dateStr.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+      if (!dm) continue;
+      const created = new Date(dm[1], dm[2] - 1, dm[3], dm[4], dm[5], dm[6]);
+      const ageSec = Math.round((now - created.getTime()) / 1000);
+
+      if (ageSec < ZOMBIE_AGE_LIMIT_SEC) continue;
+      if (isMcpInfrastructure(cmdLine, 'cmd.exe')) continue;
+
+      // This is a zombie cmd.exe - kill it
+      process.stderr.write(`[MCP_CMD] Zombie reaper: killing PID ${pidNum} (age=${ageSec}s, cmd=${cmdLine.substring(0, 60)})\n`);
+      forceKillTree(pidNum);
+      killedCount++;
+    }
+
+    if (killedCount > 0) {
+      process.stderr.write(`[MCP_CMD] Zombie reaper: killed ${killedCount} orphaned process(es)\n`);
+    }
+  } catch (_) {
+    // Silently ignore reaper errors - it's a best-effort cleanup
+  }
+}
+
+// Start zombie reaper with initial delay of 15s, then every 30s
+const _zombieReaperDelay = setTimeout(() => {
+  zombieReaper(); // Initial scan
+  const _zombieReaperInterval = setInterval(zombieReaper, ZOMBIE_SCAN_INTERVAL_MS);
+  _zombieReaperInterval.unref();
+}, 15000);
+_zombieReaperDelay.unref();
 
 // ─── Process Exit Cleanup ──────────────────────────────────────────────────────
 // When MCP server exits, kill ALL tracked active children to prevent orphans
