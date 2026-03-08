@@ -29,7 +29,7 @@ const POWERSHELL_BASE_ARGS = [
 // Inspired by MladenSU/cli-mcp-server security features
 const SECURITY_CONFIG = {
   maxCommandLength: 8192,         // Max command string length (bytes)
-  commandTimeout: 10000,          // Default timeout (ms) - tasks > 10s auto-killed
+  commandTimeout: 15000,          // Default timeout (ms) - 15s balanced for most tasks
   maxTimeout: 30000,              // Max allowed timeout (ms) - 30s for chained commands
   maxOutputSize: 10 * 1024 * 1024, // 10MB output cap
   maxBatchSize: 20,               // Max commands per batch
@@ -116,8 +116,8 @@ function destroyStreams(child) {
 // ─── Concurrency limiter (FIFO queue) ───────────────────────────────────────────
 // Max 3 simultaneous child processes. Extra work waits in a FIFO queue.
 const MAX_CONCURRENT = 3;
-const IDLE_TIMEOUT_MS = 10000; // 10s no-output → auto-kill (user requirement)
-const ABSOLUTE_MAX_LIFETIME_MS = 40000; // 40s absolute max → kill regardless of output
+const IDLE_TIMEOUT_MS = 20000; // 20s no-output → auto-kill (balanced for slow tasks like git, PS)
+const ABSOLUTE_MAX_LIFETIME_MS = 60000; // 60s absolute max → kill regardless of output
 const PROCESS_CLOSE_GRACE_MS = 3000;
 const PROCESS_DEADLINE_GRACE_MS = 10000;
 
