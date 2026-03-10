@@ -387,6 +387,83 @@ test("server entrypoints work through direct node, wrapper, and launcher", async
   }
 });
 
+test("wrapper and launcher preserve anti-hang behavior for risky commands", async (t) => {
+  const launches = [
+    { name: "wrapper", command: "node", args: ["wrapper.js", "node", "index.js"] },
+  ];
+
+  if (existsSync(resolve(repoRoot, "launcher.exe"))) {
+    launches.push({
+      name: "launcher",
+      command: "launcher.exe",
+      args: ["node", "index.js"],
+      env: { HEADLESS_TIMEOUT_SEC: "30" },
+    });
+  }
+
+  const cases = [
+    {
+      name: "cmd timeout",
+      tool: "cmd_run",
+      arguments: {
+        command: "ping -t 127.0.0.1",
+        cwd: repoRoot,
+        timeout: 1200,
+      },
+      expected: /\[TIMEOUT\] Killed after 1200ms/i,
+      maxElapsedMs: 3500,
+    },
+    {
+      name: "powershell prompt",
+      tool: "powershell_run",
+      arguments: {
+        command: "Read-Host 'Nhap'",
+        cwd: repoRoot,
+        timeout: 1500,
+      },
+      expected: /NonInteractive mode/i,
+      maxElapsedMs: 3500,
+    },
+    {
+      name: "batch continue after timeout",
+      tool: "cmd_batch",
+      arguments: {
+        commands: [
+          { command: "echo batch-start", cwd: repoRoot },
+          { command: "ping -t 127.0.0.1", cwd: repoRoot },
+          { command: "echo batch-end", cwd: repoRoot },
+        ],
+        timeout: 900,
+        continueOnError: true,
+      },
+      expected: /batch-start[\s\S]*\[TIMEOUT\][\s\S]*batch-end/i,
+      maxElapsedMs: 5000,
+    },
+  ];
+
+  for (const launch of launches) {
+    await t.test(launch.name, async (subtest) => {
+      const { client } = await connectClient(subtest, launch);
+
+      for (const entry of cases) {
+        const started = Date.now();
+        const result = await client.callTool({
+          name: entry.tool,
+          arguments: entry.arguments,
+        });
+        const elapsed = Date.now() - started;
+        const text = resultText(result);
+
+        assert.ok(
+          elapsed < entry.maxElapsedMs,
+          `Expected ${launch.name} ${entry.name} to settle under ${entry.maxElapsedMs}ms, got ${elapsed}ms`
+        );
+        assert.match(text, entry.expected, `Unexpected output for ${launch.name} ${entry.name}: ${text}`);
+      }
+    });
+  }
+});
+
 test("parallel executions are queued instead of killing in-flight work", async (t) => {
   const { client } = await connectClient(t, {
     command: "node",
