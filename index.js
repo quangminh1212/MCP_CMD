@@ -811,10 +811,25 @@ const MCP_PATTERNS = [
 function isMcpInfrastructure(cmdLine, name) {
   if (name?.toLowerCase() === "conhost.exe") return true; // system-managed
   if (!cmdLine || cmdLine.trim() === "") return true; // unknown = safe
+  // CMD with Unix-style -c flag is ALWAYS invalid on Windows → never protect
+  if (isKnownInvalidCmd(cmdLine, name)) return false;
   // Bare/interactive cmd.exe without /c or -c flag = VS Code terminal or user shell
   // cmd.exe with /c or -c is executing a command and may be a zombie if hung
   if (name?.toLowerCase() === "cmd.exe" && !/[\/-]c\s/i.test(cmdLine)) return true;
   return MCP_PATTERNS.some(p => p.test(cmdLine));
+}
+
+/**
+ * Detect CMD processes spawned with Unix-style `-c` flag instead of Windows `/c`.
+ * These are GUARANTEED to be hung because Windows cmd.exe does not recognize `-c`;
+ * it will just open an interactive prompt that waits for input forever.
+ * Common source: Antigravity IDE's run_command tool on Windows.
+ */
+function isKnownInvalidCmd(cmdLine, name) {
+  if (name?.toLowerCase() !== "cmd.exe") return false;
+  // Match: cmd.exe -c "..." (Unix syntax, invalid on Windows)
+  // But NOT: cmd.exe /c "..." (correct Windows syntax)
+  return /cmd(\.exe)?"?\s+-c\s/i.test(cmdLine);
 }
 
 server.tool(
@@ -1000,61 +1015,107 @@ server.tool(
 // processes that are NOT MCP infrastructure.
 const ZOMBIE_SCAN_INTERVAL_MS = 30000; // 30s scan interval
 const ZOMBIE_AGE_LIMIT_SEC = 30; // Kill cmd.exe processes older than 30s
+const INVALID_CMD_AGE_LIMIT_SEC = 10; // Kill known-invalid CMD (e.g. -c flag) after just 10s
 
 async function zombieReaper() {
   try {
-    // Use wmic via cmd.exe (no window flash via spawn windowsHide:true)
-    const child = spawn('cmd.exe', ['/c',
-      'wmic process where "Name=\'cmd.exe\'" get ProcessId,CreationDate,CommandLine /format:csv'
-    ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
-    child.stdin.end();
-
-    let output = '';
-    child.stdout.on('data', (chunk) => { output += chunk.toString(); });
-
-    // Safety timeout for wmic itself
-    const wmicTimer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch (_) { }
-    }, 8000);
-    wmicTimer.unref && wmicTimer.unref();
-
-    await new Promise((resolve) => {
-      child.on('close', resolve);
-      child.on('error', resolve);
-    });
-    clearTimeout(wmicTimer);
-
     const now = Date.now();
     const myPid = process.pid;
-    const lines = output.split('\n').filter(l => l.trim() && !l.startsWith('Node'));
-    let killedCount = 0;
+    let allProcs = [];
 
-    // Phase 1: Parse all cmd.exe processes
-    const allProcs = [];
-    for (const line of lines) {
-      // CSV format: Node,CommandLine,CreationDate,ProcessId
-      const parts = line.trim().split(',');
-      if (parts.length < 4) continue;
+    // Primary: PowerShell Get-CimInstance + JSON (more reliable parsing than wmic CSV)
+    let parsed = false;
+    try {
+      const psChild = spawn('powershell.exe', [
+        '-NonInteractive', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-Command',
+        `$ProgressPreference='SilentlyContinue'; @(Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -EA SilentlyContinue | Select-Object ProcessId, @{N='Created';E={$_.CreationDate.ToString('o')}}, CommandLine) | ConvertTo-Json -Compress`
+      ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      psChild.stdin.end();
 
-      // Reconstruct CommandLine (may contain commas)
-      const pidStr = parts[parts.length - 1].trim();
-      const dateStr = parts[parts.length - 2].trim();
-      const cmdLine = parts.slice(1, parts.length - 2).join(',').trim();
+      let psOutput = '';
+      psChild.stdout.on('data', (chunk) => { psOutput += chunk.toString(); });
 
-      const pidNum = parseInt(pidStr);
-      if (!pidNum || isNaN(pidNum) || pidNum === myPid) continue;
+      const psTimer = setTimeout(() => {
+        try { psChild.kill('SIGKILL'); } catch (_) { }
+      }, 10000);
+      psTimer.unref && psTimer.unref();
 
-      // Parse WMI date (yyyymmddHHMMSS.ffffff+UUU)
-      const dm = dateStr.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
-      if (!dm) continue;
-      const created = new Date(dm[1], dm[2] - 1, dm[3], dm[4], dm[5], dm[6]);
-      const ageSec = Math.round((now - created.getTime()) / 1000);
+      await new Promise((resolve) => {
+        psChild.on('close', resolve);
+        psChild.on('error', resolve);
+      });
+      clearTimeout(psTimer);
 
-      allProcs.push({ pidNum, cmdLine, created, ageSec });
+      const jsonData = JSON.parse(psOutput.trim() || '[]');
+      const arr = Array.isArray(jsonData) ? jsonData : jsonData ? [jsonData] : [];
+      for (const proc of arr) {
+        const pidNum = proc.ProcessId;
+        if (!pidNum || pidNum === myPid) continue;
+        const created = new Date(proc.Created);
+        const ageSec = Math.round((now - created.getTime()) / 1000);
+        allProcs.push({ pidNum, cmdLine: proc.CommandLine || '', created, ageSec });
+      }
+      parsed = true;
+    } catch (_) { /* PowerShell failed, fall through to wmic */ }
+
+    // Fallback: wmic CSV parsing (for older Windows)
+    if (!parsed) {
+      try {
+        const child = spawn('cmd.exe', ['/c',
+          'wmic process where "Name=\'cmd.exe\'" get ProcessId,CreationDate,CommandLine /format:csv'
+        ], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+        child.stdin.end();
+
+        let output = '';
+        child.stdout.on('data', (chunk) => { output += chunk.toString(); });
+
+        const wmicTimer = setTimeout(() => {
+          try { child.kill('SIGKILL'); } catch (_) { }
+        }, 8000);
+        wmicTimer.unref && wmicTimer.unref();
+
+        await new Promise((resolve) => {
+          child.on('close', resolve);
+          child.on('error', resolve);
+        });
+        clearTimeout(wmicTimer);
+
+        const lines = output.split('\n').filter(l => l.trim() && !l.startsWith('Node'));
+        for (const line of lines) {
+          const parts = line.trim().split(',');
+          if (parts.length < 4) continue;
+          const pidStr = parts[parts.length - 1].trim();
+          const dateStr = parts[parts.length - 2].trim();
+          const cmdLine = parts.slice(1, parts.length - 2).join(',').trim();
+          const pidNum = parseInt(pidStr);
+          if (!pidNum || isNaN(pidNum) || pidNum === myPid) continue;
+          const dm = dateStr.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})/);
+          if (!dm) continue;
+          const created = new Date(dm[1], dm[2] - 1, dm[3], dm[4], dm[5], dm[6]);
+          const ageSec = Math.round((now - created.getTime()) / 1000);
+          allProcs.push({ pidNum, cmdLine, created, ageSec });
+        }
+      } catch (_) { /* wmic also failed */ }
     }
 
-    // Phase 2: Kill non-MCP zombie processes (older than age limit)
+    let killedCount = 0;
+
+    // Phase 1: Kill known-invalid CMD processes (e.g. `-c` flag) with SHORT age limit
+    // These are GUARANTEED hung — Windows cmd.exe does not support `-c`
     for (const proc of allProcs) {
+      if (proc.ageSec < INVALID_CMD_AGE_LIMIT_SEC) continue;
+      if (isKnownInvalidCmd(proc.cmdLine, 'cmd.exe')) {
+        process.stderr.write(`[MCP_CMD] Zombie reaper: killing INVALID CMD PID ${proc.pidNum} (age=${proc.ageSec}s, uses -c flag, cmd=${proc.cmdLine.substring(0, 80)})\n`);
+        forceKillTree(proc.pidNum);
+        proc._killed = true;
+        killedCount++;
+      }
+    }
+
+    // Phase 2: Kill non-MCP zombie processes (older than standard age limit)
+    for (const proc of allProcs) {
+      if (proc._killed) continue;
       if (proc.ageSec < ZOMBIE_AGE_LIMIT_SEC) continue;
       if (isMcpInfrastructure(proc.cmdLine, 'cmd.exe')) continue;
 
@@ -1077,10 +1138,8 @@ async function zombieReaper() {
     }
 
     for (const [, group] of cmdGroups) {
-      if (group.length <= 1) continue; // No duplicates
-      // Sort by creation time descending (newest first)
+      if (group.length <= 1) continue;
       group.sort((a, b) => b.created.getTime() - a.created.getTime());
-      // Kill all but the newest
       for (let i = 1; i < group.length; i++) {
         const old = group[i];
         process.stderr.write(`[MCP_CMD] Zombie reaper: killing DUPLICATE PID ${old.pidNum} (age=${old.ageSec}s, kept PID ${group[0].pidNum}, cmd=${old.cmdLine.substring(0, 60)})\n`);
@@ -1092,8 +1151,9 @@ async function zombieReaper() {
     if (killedCount > 0) {
       process.stderr.write(`[MCP_CMD] Zombie reaper: killed ${killedCount} orphaned process(es)\n`);
     }
-  } catch (_) {
-    // Silently ignore reaper errors - it's a best-effort cleanup
+  } catch (err) {
+    // Log reaper errors for debugging instead of swallowing completely
+    try { process.stderr.write(`[MCP_CMD] Zombie reaper error: ${err?.message || err}\n`); } catch (_) { }
   }
 }
 
