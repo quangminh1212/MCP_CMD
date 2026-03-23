@@ -638,6 +638,117 @@ server.tool(
   }
 );
 
+// ─── Tool 1.5: Run a CMD command as Administrator (elevated) ───────────────────
+
+server.tool(
+  "cmd_admin_run",
+  "Run a Windows CMD command with Administrator (elevated) privileges. Uses PowerShell Start-Process -Verb RunAs to launch an elevated cmd.exe. Output is captured via temp files since elevated processes cannot pipe stdio to non-elevated parents. Use this for commands that require admin rights (e.g., netsh, sc query, icacls, dism, sfc). NOTE: UAC prompt may appear if not already elevated.",
+  {
+    command: z.string().describe("The CMD command to run as Administrator"),
+    cwd: z.string().optional().describe("Working directory. Defaults to the server start directory."),
+    timeout: z
+      .number()
+      .optional()
+      .describe("Timeout in ms. Defaults to 15000. Max 30000."),
+  },
+  async ({ command, cwd, timeout }) => {
+    const workDir = validateCwd(cwd);
+    const timeoutMs = Math.max(100, Math.min(timeout || SECURITY_CONFIG.commandTimeout, SECURITY_CONFIG.maxTimeout));
+
+    // Security: analyze command before elevation
+    const analysis = analyzeCommand(command);
+    const securityPrefix = analysis.warnings.length > 0 ? analysis.warnings.join('\n') + '\n' : '';
+
+    if (analysis.alwaysBlocked) {
+      return { content: [{ type: "text", text: `${securityPrefix}[BLOCKED] System-level destructive command rejected (even with admin).\n[EXIT 1]` }] };
+    }
+
+    if (command.length > SECURITY_CONFIG.maxCommandLength) {
+      return { content: [{ type: "text", text: `[SECURITY] Command rejected: exceeds max length (${command.length}/${SECURITY_CONFIG.maxCommandLength})\n[EXIT 1]` }] };
+    }
+
+    // Generate unique temp file paths for stdout/stderr capture
+    const tempId = `mcp_admin_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    const tempDir = process.env.TEMP || process.env.TMP || 'C:\\Windows\\Temp';
+    const outFile = join(tempDir, `${tempId}_out.txt`);
+    const errFile = join(tempDir, `${tempId}_err.txt`);
+    const exitFile = join(tempDir, `${tempId}_exit.txt`);
+
+    // Escape single quotes in command for PowerShell embedding
+    const escapedCommand = command.replace(/'/g, "''");
+    const escapedCwd = workDir.replace(/'/g, "''");
+    const escapedOutFile = outFile.replace(/'/g, "''");
+    const escapedErrFile = errFile.replace(/'/g, "''");
+    const escapedExitFile = exitFile.replace(/'/g, "''");
+
+
+    // PowerShell script to Start-Process with -Verb RunAs and -Wait
+    const psScript = `
+      $ProgressPreference = 'SilentlyContinue';
+      try {
+        $p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c ${escapedCommand.replace(/'/g, "''")} > "${escapedOutFile}" 2> "${escapedErrFile}" & echo !errorlevel! > "${escapedExitFile}"' -Verb RunAs -WindowStyle Hidden -WorkingDirectory '${escapedCwd}' -Wait -PassThru -ErrorAction Stop;
+        $p.ExitCode
+      } catch {
+        $_.Exception.Message | Out-File -FilePath '${escapedErrFile}' -Encoding UTF8;
+        '1' | Out-File -FilePath '${escapedExitFile}' -Encoding UTF8;
+        Write-Output "ADMIN_ERROR: $($_.Exception.Message)"
+      }
+    `;
+
+    const result = await runSpawnedProcess({
+      fileName: "powershell.exe",
+      args: [...POWERSHELL_BASE_ARGS, "-Command", psScript],
+      cwd: workDir,
+      timeoutMs,
+      maxOutput: SECURITY_CONFIG.maxOutputSize / 2,
+    });
+
+    // Read output from temp files
+    let stdout = "", stderr = "", exitCode = null;
+    try {
+      const { readFileSync, unlinkSync } = await import("fs");
+      try { stdout = readFileSync(outFile, "utf-8").trim(); } catch (_) { }
+      try { stderr = readFileSync(errFile, "utf-8").trim(); } catch (_) { }
+      try {
+        const exitStr = readFileSync(exitFile, "utf-8").trim();
+        exitCode = parseInt(exitStr) || 0;
+      } catch (_) { }
+      // Cleanup temp files
+      try { unlinkSync(outFile); } catch (_) { }
+      try { unlinkSync(errFile); } catch (_) { }
+      try { unlinkSync(exitFile); } catch (_) { }
+    } catch (_) { /* fs import or read failed */ }
+
+    // If temp files had no output, fall back to PowerShell's own output
+    if (!stdout && !stderr && result.stdout) {
+      // Check for ADMIN_ERROR from PowerShell catch block
+      if (result.stdout.includes("ADMIN_ERROR:")) {
+        stderr = result.stdout;
+        exitCode = 1;
+      }
+    }
+
+    // Combine stderr from PS and from temp file
+    const combinedStderr = [result.stderr, stderr].filter(Boolean).join("\n");
+
+    const parts = [];
+    if (securityPrefix) parts.push(securityPrefix.trim());
+    parts.push("[ADMIN] Elevated execution");
+    if (stdout) parts.push(stdout);
+    if (combinedStderr) parts.push(`[STDERR] ${combinedStderr}`);
+    if (result.timedOut) {
+      parts.push(`[TIMEOUT] Admin command killed after ${timeoutMs}ms`);
+    }
+    if (exitCode !== null) {
+      parts.push(`[EXIT ${exitCode}]`);
+    } else {
+      parts.push(`[EXIT ${result.exitCode ?? 1}]`);
+    }
+
+    return { content: [{ type: "text", text: parts.join("\n") || "[NO OUTPUT]" }] };
+  }
+);
+
 // ─── Tool 2: Run multiple CMD commands sequentially ────────────────────────────
 
 server.tool(
