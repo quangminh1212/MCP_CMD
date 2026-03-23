@@ -116,8 +116,8 @@ function destroyStreams(child) {
 // ─── Concurrency limiter (FIFO queue) ───────────────────────────────────────────
 // Max 3 simultaneous child processes. Extra work waits in a FIFO queue.
 const MAX_CONCURRENT = 3;
-const IDLE_TIMEOUT_MS = 20000; // 20s no-output → auto-kill (balanced for slow tasks like git, PS)
-const ABSOLUTE_MAX_LIFETIME_MS = 60000; // 60s absolute max → kill regardless of output
+const IDLE_TIMEOUT_MS = 60000; // 60s no-output → auto-kill (generous for slow tasks like git, PS, builds)
+const ABSOLUTE_MAX_LIFETIME_MS = 120000; // 120s absolute max → kill regardless of output
 const PROCESS_CLOSE_GRACE_MS = 500;
 const PROCESS_EXIT_FALLBACK_MS = 250;
 const PROCESS_POST_TIMEOUT_SETTLE_MS = 500;
@@ -927,6 +927,14 @@ function isMcpInfrastructure(cmdLine, name) {
   // Bare/interactive cmd.exe without /c or -c flag = VS Code terminal or user shell
   // cmd.exe with /c or -c is executing a command and may be a zombie if hung
   if (name?.toLowerCase() === "cmd.exe" && !/[\/-]c\s/i.test(cmdLine)) return true;
+  // Protect external CMD windows (user-opened, with window titles like start.bat, stop.bat, etc.)
+  // Only kill cmd.exe that was spawned by our own MCP_CMD tools (detected by /c flag + no title)
+  if (name?.toLowerCase() === "cmd.exe" && /cmd(\.exe)?"?\s+\/c\s/i.test(cmdLine)) {
+    // If it looks like a user script (start, stop, .bat, .cmd), protect it
+    if (/\.(bat|cmd)"?\s*$/i.test(cmdLine) || /\.(bat|cmd)"?\s+/i.test(cmdLine)) return true;
+    // If it has a window title (via start "title"), protect it
+    if (/start\s+"/i.test(cmdLine)) return true;
+  }
   return MCP_PATTERNS.some(p => p.test(cmdLine));
 }
 
@@ -1125,8 +1133,8 @@ server.tool(
 // Uses cmd.exe "wmic" (no PowerShell flash) to check for old hanging cmd.exe
 // processes that are NOT MCP infrastructure.
 const ZOMBIE_SCAN_INTERVAL_MS = 30000; // 30s scan interval
-const ZOMBIE_AGE_LIMIT_SEC = 30; // Kill cmd.exe processes older than 30s
-const INVALID_CMD_AGE_LIMIT_SEC = 10; // Kill known-invalid CMD (e.g. -c flag) after just 10s
+const ZOMBIE_AGE_LIMIT_SEC = 60; // Kill cmd.exe processes older than 60s (generous to avoid killing active CMDs)
+const INVALID_CMD_AGE_LIMIT_SEC = 15; // Kill known-invalid CMD (e.g. -c flag) after 15s
 
 async function zombieReaper() {
   try {
