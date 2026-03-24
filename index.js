@@ -116,8 +116,8 @@ function destroyStreams(child) {
 // ─── Concurrency limiter (FIFO queue) ───────────────────────────────────────────
 // Max 3 simultaneous child processes. Extra work waits in a FIFO queue.
 const MAX_CONCURRENT = 3;
-const IDLE_TIMEOUT_MS = 60000; // 60s no-output → auto-kill (generous for slow tasks like git, PS, builds)
-const ABSOLUTE_MAX_LIFETIME_MS = 120000; // 120s absolute max → kill regardless of output
+const IDLE_TIMEOUT_MS = 120000; // 120s no-output → auto-kill (generous for slow tasks like git, PS, builds)
+const ABSOLUTE_MAX_LIFETIME_MS = 300000; // 300s (5 min) absolute max → kill regardless of output
 const PROCESS_CLOSE_GRACE_MS = 500;
 const PROCESS_EXIT_FALLBACK_MS = 250;
 const PROCESS_POST_TIMEOUT_SETTLE_MS = 500;
@@ -919,6 +919,32 @@ const MCP_PATTERNS = [
   /mem0/i, // mem0 memory MCP server
 ];
 
+// Build tool processes: long-running by nature, must NOT be killed by zombie reaper.
+// These are child processes of .bat build scripts (dotnet, msbuild, nuget, etc.)
+const BUILD_TOOL_PATTERNS = [
+  /dotnet(\.exe)?/i,           // .NET CLI (build, publish, run, restore)
+  /msbuild(\.exe)?/i,          // MSBuild compiler
+  /nuget(\.exe)?/i,            // NuGet package manager
+  /devenv(\.exe)?/i,           // Visual Studio
+  /cl(\.exe)?\s/i,             // MSVC C++ compiler
+  /link(\.exe)?\s/i,           // MSVC linker
+  /cmake(\.exe)?/i,            // CMake
+  /make(\.exe)?/i,             // GNU Make
+  /ninja(\.exe)?/i,            // Ninja build
+  /gradle/i,                   // Gradle (Java/Kotlin)
+  /mvn(\.cmd)?/i,              // Maven (Java)
+  /cargo(\.exe)?/i,            // Rust build tool
+  /go\s+(build|install|test)/i, // Go build commands
+  /javac(\.exe)?/i,            // Java compiler
+  /tsc(\.exe)?/i,              // TypeScript compiler
+  /wix(\.exe)?/i,              // WiX toolset (installer builder)
+  /candle(\.exe)?/i,           // WiX candle (compiler)
+  /light(\.exe)?/i,            // WiX light (linker)
+  /heat(\.exe)?/i,             // WiX heat (harvester)
+  /signtool(\.exe)?/i,         // Code signing tool
+  /build[\-_]?(prod|dev|sign|cert|driver|for)/i, // Custom build scripts
+];
+
 function isMcpInfrastructure(cmdLine, name) {
   if (name?.toLowerCase() === "conhost.exe") return true; // system-managed
   if (!cmdLine || cmdLine.trim() === "") return true; // unknown = safe
@@ -927,6 +953,8 @@ function isMcpInfrastructure(cmdLine, name) {
   // Bare/interactive cmd.exe without /c or -c flag = VS Code terminal or user shell
   // cmd.exe with /c or -c is executing a command and may be a zombie if hung
   if (name?.toLowerCase() === "cmd.exe" && !/[\/-]c\s/i.test(cmdLine)) return true;
+  // Protect build tool processes (dotnet, msbuild, nuget, etc.) - these are long-running by nature
+  if (BUILD_TOOL_PATTERNS.some(p => p.test(cmdLine))) return true;
   // Protect external CMD windows (user-opened, with window titles like start.bat, stop.bat, etc.)
   // Only kill cmd.exe that was spawned by our own MCP_CMD tools (detected by /c flag + no title)
   if (name?.toLowerCase() === "cmd.exe" && /cmd(\.exe)?"?\s+\/c\s/i.test(cmdLine)) {
@@ -1133,7 +1161,7 @@ server.tool(
 // Uses cmd.exe "wmic" (no PowerShell flash) to check for old hanging cmd.exe
 // processes that are NOT MCP infrastructure.
 const ZOMBIE_SCAN_INTERVAL_MS = 30000; // 30s scan interval
-const ZOMBIE_AGE_LIMIT_SEC = 60; // Kill cmd.exe processes older than 60s (generous to avoid killing active CMDs)
+const ZOMBIE_AGE_LIMIT_SEC = 300; // Kill cmd.exe processes older than 300s/5min (safe for build scripts)
 const INVALID_CMD_AGE_LIMIT_SEC = 15; // Kill known-invalid CMD (e.g. -c flag) after 15s
 
 async function zombieReaper() {
